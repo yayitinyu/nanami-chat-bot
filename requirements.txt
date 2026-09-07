@@ -1,0 +1,6 @@
+python-telegram-bot[job-queue,rate-limiter,webhooks]==22.8
+aiosqlite==0.22.1
+pydantic-settings==2.15.0
+python-dotenv==1.1.1
+langdetect==1.0.9
+pytest==8.4.2

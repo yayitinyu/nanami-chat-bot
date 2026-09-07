@@ -1,0 +1,57 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install
+        run: pip install -r requirements.txt
+      - name: Test
+        run: pytest -q
+
+  image:
+    needs: test
+    uses: docker/github-builder/.github/workflows/build.yml@v1
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
+      attestations: write
+    with:
+      output: image
+      # Native runners: linux/amd64 -> ubuntu-24.04, linux/arm64 -> ubuntu-24.04-arm.
+      # setup-qemu stays false so nothing is emulated.
+      setup-qemu: false
+      distribute: true
+      platforms: linux/amd64,linux/arm64
+      cache: true
+      push: ${{ github.event_name != 'pull_request' }}
+      sign: ${{ github.event_name != 'pull_request' && 'auto' || 'false' }}
+      meta-images: ghcr.io/${{ github.repository }}
+      set-meta-labels: true
+      meta-tags: |
+        type=raw,value=latest,enable={{is_default_branch}}
+        type=ref,event=branch
+        type=ref,event=pr
+        type=semver,pattern={{version}}
+        type=sha,prefix=sha-
+    secrets:
+      registry-auths: |
+        - registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
