@@ -8,6 +8,11 @@ services:
     environment:
       DATABASE_PATH: /app/data/bot.db
       TZ: ${TZ:-Asia/Shanghai}
+      # Host publish port still comes from WEBHOOK_PORT in .env (see ports).
+      # The process inside the container must listen on 8080, which is what
+      # the published mapping targets. Without this override, setting
+      # WEBHOOK_PORT=28080 makes the app bind 28080 while Docker forwards to 8080.
+      WEBHOOK_PORT: "8080"
     volumes:
       - bot-data:/app/data
     ports:

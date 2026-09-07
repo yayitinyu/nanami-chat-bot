@@ -57,7 +57,7 @@ WEBHOOK_SECRET=long-random-string
 | `ADMIN_CHAT_ID` | 可选。群/超级群 ID。论坛群会按用户建主题 |
 | `WEBHOOK_URL` | 可选。公网 HTTPS 地址，设置后启用 webhook |
 | `WEBHOOK_LISTEN` | 默认 `0.0.0.0` |
-| `WEBHOOK_PORT` | 默认 `8080` |
+| `WEBHOOK_PORT` | 默认 `8080`。Docker Compose 下这是**宿主机**映射端口，容器内进程固定监听 `8080` |
 | `WEBHOOK_PATH` | 默认 `/telegram`（若 URL 里已有 path 则用 URL） |
 | `WEBHOOK_SECRET` | 可选。Telegram `secret_token` |
 | `DATABASE_PATH` | 默认 `data/bot.db` |
