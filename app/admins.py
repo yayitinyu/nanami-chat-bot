@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 from telegram import Message
 from telegram.ext.filters import MessageFilter
 
@@ -10,6 +12,7 @@ class AdminStore:
     def __init__(self, env_ids: list[int]) -> None:
         self.env_ids = set(env_ids)
         self.extra_ids: set[int] = set()
+        self._lock = asyncio.Lock()
 
     @property
     def all_ids(self) -> set[int]:
@@ -25,18 +28,22 @@ class AdminStore:
         self.extra_ids = set(await database.extra_admin_ids())
 
     async def add(self, database: Database, user_id: int) -> bool:
-        if user_id in self.all_ids:
-            return False
-        self.extra_ids.add(user_id)
-        await database.set_extra_admin_ids(sorted(self.extra_ids))
-        return True
+        async with self._lock:
+            if user_id in self.all_ids:
+                return False
+            candidate = self.extra_ids | {user_id}
+            await database.set_extra_admin_ids(sorted(candidate))
+            self.extra_ids = candidate
+            return True
 
     async def remove(self, database: Database, user_id: int) -> bool:
-        if user_id in self.env_ids or user_id not in self.extra_ids:
-            return False
-        self.extra_ids.discard(user_id)
-        await database.set_extra_admin_ids(sorted(self.extra_ids))
-        return True
+        async with self._lock:
+            if user_id in self.env_ids or user_id not in self.extra_ids:
+                return False
+            candidate = self.extra_ids - {user_id}
+            await database.set_extra_admin_ids(sorted(candidate))
+            self.extra_ids = candidate
+            return True
 
 
 class AdminFilter(MessageFilter):

@@ -1,9 +1,12 @@
 services:
   bot:
     build: .
-    image: ghcr.io/yayitinyu/nanami-chat-bot:latest
+    image: ${BOT_IMAGE:-ghcr.io/yayitinyu/nanami-chat-bot:latest}
     container_name: nanami-chat-bot
     restart: unless-stopped
+    init: true
+    read_only: true
+    stop_grace_period: 30s
     env_file: .env
     environment:
       DATABASE_PATH: /app/data/bot.db
@@ -16,7 +19,15 @@ services:
     volumes:
       - bot-data:/app/data
     ports:
-      - "${WEBHOOK_PORT:-8080}:8080"
+      - "${WEBHOOK_BIND:-127.0.0.1}:${WEBHOOK_PORT:-8080}:8080"
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 128
+    mem_limit: 512m
     logging:
       driver: json-file
       options:

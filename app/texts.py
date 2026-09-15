@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from app.i18n import format_duration, media_label, t
-from app.models import LANG_LABELS, MEDIA_TYPES, BotSettings, User
-from app.utils import escape, format_ts
+from app.models import LANG_LABELS, BotSettings, User
+from app.utils import display_name, display_text, escape, format_ts, now_ts
 
 
 def on_off(value: bool, lang: str = "zh") -> str:
@@ -41,22 +41,22 @@ def user_card(user: User, lang: str = "zh") -> str:
         status.append(t("user.status.banned", lang))
     if user.is_blocked:
         status.append(t("user.status.blocked", lang))
-    if user.muted_until:
+    if user.muted_until > now_ts():
         status.append(t("user.status.muted", lang, until=format_ts(user.muted_until)))
     if not user.captcha_passed:
         status.append(t("user.status.unverified", lang))
     if not status:
         status.append(t("user.status.ok", lang))
-    uname = f"@{user.username}" if user.username else "-"
-    notes = t("user.notes", lang, notes=user.notes) if user.notes else ""
+    uname = f"@{escape(display_text(user.username))}" if user.username else "-"
+    notes = t("user.notes", lang, notes=escape(user.notes)) if user.notes else ""
     return t(
         "user.card",
         lang,
-        name=escape(user.full_name),
+        name=escape(display_name(user)),
         uname=uname,
         id=user.user_id,
         status=" · ".join(status),
-        lang=user.language_code or "-",
+        language=escape(user.language_code or "-"),
         created=format_ts(user.created_at),
         seen=format_ts(user.last_seen_at),
         count=user.message_count,
@@ -137,7 +137,7 @@ def media_text(s: BotSettings, lang: str = "zh") -> str:
 
 
 def link_text(s: BotSettings, domains: list[str], lang: str = "zh") -> str:
-    allow = "\n".join(f"· {d}" for d in domains) if domains else t("empty", lang)
+    allow = "\n".join(f"· {escape(d)}" for d in domains[:15]) if domains else t("empty", lang)
     return (
         f"{t('link.title', lang)}\n\n"
         + t(
@@ -152,7 +152,7 @@ def link_text(s: BotSettings, domains: list[str], lang: str = "zh") -> str:
 
 
 def keyword_filter_text(s: BotSettings, keywords: list[str], lang: str = "zh") -> str:
-    body = "\n".join(f"· {k}" for k in keywords) if keywords else t("empty", lang)
+    body = "\n".join(f"· {escape(k)}" for k in keywords[:20]) if keywords else t("empty", lang)
     return (
         f"{t('kw_filter.title', lang)}\n\n"
         + t("kw_filter.body", lang, v=on_off(s.keyword_filter_enabled, lang), body=body)
@@ -164,9 +164,9 @@ def auto_reply_text(items: list[tuple[int, str, str, bool]], lang: str = "zh") -
         body = t("ar.empty", lang)
     else:
         lines = []
-        for item_id, keyword, match_type, enabled in items:
+        for item_id, keyword, match_type, enabled in items[:20]:
             flag = on_off(enabled, lang)
-            lines.append(f"{item_id}. [{flag}|{match_type}] {keyword}")
+            lines.append(f"{item_id}. [{flag}|{escape(match_type)}] {escape(keyword)}")
         body = "\n".join(lines)
     return f"{t('ar.title', lang)}\n\n{body}"
 
@@ -176,9 +176,9 @@ def broadcast_list_text(items: list[tuple[int, str, bool, str]], lang: str = "zh
         body = t("bc.empty", lang)
     else:
         lines = []
-        for item_id, summary, enabled, interval in items:
+        for item_id, summary, enabled, interval in items[:12]:
             flag = on_off(enabled, lang)
-            lines.append(f"{item_id}. [{flag}] {interval} · {summary}")
+            lines.append(f"{item_id}. [{flag}] {escape(interval)} · {escape(summary)}")
         body = "\n".join(lines)
     return f"{t('bc.title', lang)}\n\n{t('bc.help', lang)}\n\n{body}"
 
@@ -194,6 +194,3 @@ def ui_text(s: BotSettings, lang: str = "zh") -> str:
         f"{t('ui.forum', lang, v=on_off(s.forum_topics_enabled, lang))}\n\n"
         f"{t('ui.forum.help', lang)}"
     )
-
-
-assert set(media_label(k, "zh") for k in MEDIA_TYPES)

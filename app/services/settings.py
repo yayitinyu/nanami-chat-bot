@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
+from copy import deepcopy
 from typing import Any
 
 from app.db import Database
@@ -11,32 +13,41 @@ class SettingsService:
     def __init__(self, database: Database) -> None:
         self.db = database
         self._current = BotSettings()
+        self._lock = asyncio.Lock()
 
     @property
     def current(self) -> BotSettings:
         return self._current
 
     async def load(self) -> BotSettings:
-        self._current = await self.db.load_bot_settings()
-        return self._current
-
-    async def save(self) -> None:
-        await self.db.save_bot_settings(self._current)
+        async with self._lock:
+            self._current = await self.db.load_bot_settings()
+            return self._current
 
     async def update(self, **changes: Any) -> BotSettings:
-        for key, value in changes.items():
-            if not hasattr(self._current, key):
-                raise AttributeError(key)
-            setattr(self._current, key, value)
-        await self.save()
-        return self._current
+        async with self._lock:
+            candidate = deepcopy(self._current)
+            for key, value in changes.items():
+                if not hasattr(candidate, key):
+                    raise AttributeError(key)
+                setattr(candidate, key, value)
+            await self.db.save_bot_settings(candidate)
+            self._current = candidate
+            return self._current
 
     async def toggle(self, field: str) -> bool:
-        value = not bool(getattr(self._current, field))
-        await self.update(**{field: value})
-        return value
+        async with self._lock:
+            candidate = deepcopy(self._current)
+            value = not bool(getattr(candidate, field))
+            setattr(candidate, field, value)
+            await self.db.save_bot_settings(candidate)
+            self._current = candidate
+            return value
 
     async def mutate(self, mutator: Callable[[BotSettings], None]) -> BotSettings:
-        mutator(self._current)
-        await self.save()
-        return self._current
+        async with self._lock:
+            candidate = deepcopy(self._current)
+            mutator(candidate)
+            await self.db.save_bot_settings(candidate)
+            self._current = candidate
+            return self._current

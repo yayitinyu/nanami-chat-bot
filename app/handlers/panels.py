@@ -6,7 +6,7 @@ from telegram.ext import ContextTypes
 from app import ctx, keyboards, texts
 from app.handlers.common import edit_panel
 from app.i18n import format_duration, t
-from app.utils import page_count
+from app.utils import display_name, display_text, escape, page_count
 
 
 def _lang(query, context) -> str:
@@ -49,11 +49,11 @@ async def show_users(
     rows = []
     for user in users:
         flag = "🚫 " if user.is_banned else ""
-        uname = f"@{user.username}" if user.username else str(user.user_id)
-        rows.append((user.user_id, f"{flag}{user.full_name} · {uname}"))
+        uname = f"@{display_text(user.username)}" if user.username else str(user.user_id)
+        rows.append((user.user_id, f"{flag}{display_name(user)} · {uname}"))
     title = t("users.title", lang)
     if search:
-        title += "\n" + t("users.search", lang, q=search)
+        title += "\n" + t("users.search", lang, q=escape(search[:256]))
     title += "\n" + t("users.total", lang, n=total)
     await edit_panel(
         query,

@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field, fields
 from typing import Any
 
-
 DEFAULT_START_MESSAGE = "你好，请直接发送消息，管理员会尽快回复。"
 
 MEDIA_TYPES = (

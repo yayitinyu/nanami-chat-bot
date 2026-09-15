@@ -1,17 +1,18 @@
 from __future__ import annotations
 
-import re
 from typing import TYPE_CHECKING
 
 from app.models import BotSettings, FilterVerdict
 from app.services.language import detect_language
 from app.utils import (
+    LinkScanTimeout,
     domain_matches,
     extract_mentions,
     extract_urls,
     is_telegram_link,
     media_kind,
     message_plain_text,
+    moderation_text,
     normalize_domain,
     utf16_slice,
 )
@@ -21,11 +22,11 @@ if TYPE_CHECKING:
 
 
 def keyword_hit(text: str, keywords: list[str]) -> str | None:
-    haystack = (text or "").casefold()
+    haystack = moderation_text(text)
     if not haystack:
         return None
     for raw in keywords:
-        needle = raw.casefold().strip()
+        needle = moderation_text(raw).strip()
         if needle and needle in haystack:
             return raw
     return None
@@ -51,15 +52,25 @@ def check_message(
             return FilterVerdict(False, "keyword", hit)
 
     if settings.link_filter_enabled:
-        urls = extract_urls(text)
+        try:
+            urls = extract_urls(text)
+        except LinkScanTimeout:
+            return FilterVerdict(False, "link", "obfuscated")
         entities = list(message.entities or ()) + list(message.caption_entities or ())
         for ent in entities:
-            if getattr(ent, "type", None) in {"url", "text_link"}:
+            entity_type = getattr(ent, "type", None)
+            if entity_type in {"url", "text_link", "email"}:
                 piece = getattr(ent, "url", None)
                 if not piece and text:
                     piece = utf16_slice(text, int(ent.offset), int(ent.length))
                 if piece:
-                    urls.append(piece)
+                    urls.append(f"mailto:{piece}" if entity_type == "email" else piece)
+            elif settings.link_block_mentions and entity_type in {
+                "mention",
+                "text_mention",
+            }:
+                piece = utf16_slice(text, int(ent.offset), int(ent.length))
+                return FilterVerdict(False, "link", piece or "mention")
         for url in urls:
             domain = normalize_domain(url)
             if domain_matches(domain, allow_domains):
@@ -79,10 +90,3 @@ def check_message(
             return FilterVerdict(False, "language", lang)
 
     return FilterVerdict(True)
-
-
-def compile_regex(pattern: str) -> re.Pattern[str] | None:
-    try:
-        return re.compile(pattern, re.IGNORECASE | re.DOTALL)
-    except re.error:
-        return None

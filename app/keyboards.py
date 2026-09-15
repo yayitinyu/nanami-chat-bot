@@ -5,12 +5,16 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from app.i18n import media_label, t
 from app.models import LANG_LABELS, MEDIA_TYPES, BotSettings
 from app.texts import mark, on_off
+from app.utils import display_text
 
 USERS_PER_PAGE = 8
 
 
 def _btn(text: str, data: str) -> InlineKeyboardButton:
-    return InlineKeyboardButton(text, callback_data=data)
+    label = display_text(text) or " "
+    if len(label) > 64:
+        label = label[:63] + "…"
+    return InlineKeyboardButton(label, callback_data=data)
 
 
 def _grid(buttons: list[InlineKeyboardButton], cols: int) -> list[list[InlineKeyboardButton]]:

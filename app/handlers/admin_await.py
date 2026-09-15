@@ -9,10 +9,18 @@ from telegram.ext import ContextTypes
 from app import ctx, keyboards, texts
 from app.handlers.common import clear_await, get_await, safe_reply, set_await
 from app.i18n import t
-from app.services.auto_reply import parse_keyword_line
+from app.services.auto_reply import parse_keyword_line, valid_auto_reply_keyword
 from app.services.broadcast import draft_from_message, schedule
 from app.services.forwarding import copy_to_user
-from app.utils import normalize_domain, parse_duration
+from app.utils import (
+    display_name,
+    display_text,
+    escape,
+    is_valid_domain,
+    normalize_domain,
+    parse_duration,
+    parse_telegram_user_id,
+)
 
 log = logging.getLogger(__name__)
 
@@ -60,11 +68,16 @@ async def await_search(message: Message, context: ContextTypes.DEFAULT_TYPE, sta
         await safe_reply(message, t("msg.user_not_found", lang))
         return
     rows = [
-        (u.user_id, f"{u.full_name} · @{u.username}" if u.username else f"{u.full_name} · {u.user_id}")
+        (
+            u.user_id,
+            f"{display_name(u)} · @{display_text(u.username)}"
+            if u.username
+            else f"{display_name(u)} · {u.user_id}",
+        )
         for u in users
     ]
     await message.reply_text(
-        f"{t('btn.search', lang)}\n{text}",
+        f"{t('btn.search', lang)}\n{escape(text[:256])}",
         parse_mode="HTML",
         reply_markup=keyboards.user_list_keyboard(rows, 0, 1, False, lang),
     )
@@ -84,13 +97,13 @@ async def await_start(message: Message, context: ContextTypes.DEFAULT_TYPE, stat
     if not text:
         await safe_reply(message, t("msg.invalid", lang))
         return
-    clear_await(context)
-    await ctx.settings_svc(context).update(start_message=text)
     try:
         await message.reply_text(text, parse_mode="HTML", disable_web_page_preview=True)
     except TelegramError:
         await safe_reply(message, t("msg.html_invalid", lang))
         return
+    await ctx.settings_svc(context).update(start_message=text)
+    clear_await(context)
     await safe_reply(message, t("msg.saved", lang))
 
 
@@ -101,7 +114,7 @@ async def await_ar_keyword(message: Message, context: ContextTypes.DEFAULT_TYPE,
         await safe_reply(message, t("msg.invalid", lang))
         return
     match_type, keyword = parse_keyword_line(text)
-    if not keyword:
+    if not valid_auto_reply_keyword(match_type, keyword):
         await safe_reply(message, t("msg.invalid", lang))
         return
     set_await(context, "ar_reply", match_type=match_type, keyword=keyword)
@@ -136,10 +149,10 @@ async def await_domain(message: Message, context: ContextTypes.DEFAULT_TYPE, sta
     if not text:
         await safe_reply(message, t("msg.invalid", lang))
         return
-    domain = normalize_domain(text)
-    if "." not in domain:
+    if not is_valid_domain(text):
         await safe_reply(message, t("msg.invalid", lang))
         return
+    domain = normalize_domain(text)
     clear_await(context)
     ok = await ctx.db(context).add_allow_domain(domain)
     await safe_reply(message, t("msg.added" if ok else "msg.exists", lang))
@@ -153,13 +166,19 @@ async def await_rate_value(message: Message, context: ContextTypes.DEFAULT_TYPE,
         await safe_reply(message, t("msg.invalid", lang))
         return
     if field in {"rate_limit_window", "rate_limit_mute"}:
-        seconds = parse_duration(text)
+        maximum = 86400 if field == "rate_limit_window" else 30 * 86400
+        seconds = parse_duration(text, max_seconds=maximum)
         if seconds is None:
             await safe_reply(message, t("msg.duration_hint", lang))
             return
         value = seconds
     else:
-        if not text.isdigit() or int(text) < 1:
+        if (
+            not text.isascii()
+            or not text.isdigit()
+            or len(text) > 3
+            or not 1 <= int(text) <= 100
+        ):
             await safe_reply(message, t("msg.invalid", lang))
             return
         value = int(text)
@@ -203,7 +222,7 @@ async def await_add_admin(message: Message, context: ContextTypes.DEFAULT_TYPE, 
         await safe_reply(message, t("msg.invalid", lang))
         return
     user = await ctx.db(context).find_user(text)
-    user_id = user.user_id if user else (int(text) if text.lstrip("-").isdigit() else None)
+    user_id = user.user_id if user else parse_telegram_user_id(text)
     if user_id is None:
         await safe_reply(message, t("msg.user_not_found", lang))
         return

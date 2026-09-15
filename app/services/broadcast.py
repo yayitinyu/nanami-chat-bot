@@ -7,8 +7,8 @@ from telegram.error import Forbidden, RetryAfter, TelegramError
 from telegram.ext import Application, ContextTypes
 
 from app import ctx
-from app.i18n import t
 from app.db import Database
+from app.i18n import t
 from app.models import Broadcast
 from app.utils import extract_media, now_ts
 
@@ -19,6 +19,12 @@ JOB_PREFIX = "broadcast:"
 
 def job_name(broadcast_id: int) -> str:
     return f"{JOB_PREFIX}{broadcast_id}"
+
+
+def retry_after_seconds(value: int | timedelta) -> float:
+    if isinstance(value, timedelta):
+        return max(0.0, value.total_seconds())
+    return max(0.0, float(value))
 
 
 async def send_one(
@@ -106,7 +112,7 @@ async def deliver(
             else:
                 fail += 1
         except RetryAfter as exc:
-            await _sleep(float(exc.retry_after) + 0.5)
+            await _sleep(retry_after_seconds(exc.retry_after) + 0.5)
             try:
                 if await send_one(context, user_id, item):
                     ok += 1

@@ -16,6 +16,8 @@ Telegram 私聊客服 / 消息转发机器人。用户把消息发给 Bot，管�
 - **用户管理**：搜索、封禁 / 解禁、重置验证
 - **反骚扰**：验证码、限流、关键词 / 语言 / 媒体 / 链接过滤
 
+验证码用于轻量准入，并非对专业自动化的强人机验证。公开 Bot 建议同时开启消息限流，并按实际骚扰样本维护关键词与链接策略。
+
 ## 准备
 
 1. [@BotFather](https://t.me/BotFather) 创建 Bot，拿到 token
@@ -26,7 +28,8 @@ Telegram 私聊客服 / 消息转发机器人。用户把消息发给 Bot，管�
 
 ```bash
 cp .env.example .env
-# 填 BOT_TOKEN、ADMIN_IDS，可选 ADMIN_CHAT_ID / WEBHOOK_URL
+# 填 BOT_TOKEN、ADMIN_IDS；启用 Webhook 时同时填写 WEBHOOK_URL / WEBHOOK_SECRET
+chmod 600 .env
 docker compose up -d --build
 ```
 
@@ -39,14 +42,18 @@ docker compose up -d
 
 ## Webhook
 
-设置 `WEBHOOK_URL` 后走 Webhook，不再轮询。容器监听 `0.0.0.0:8080`，前面需要 TLS 反代（Caddy / Nginx / Cloudflare Tunnel）。
+设置 `WEBHOOK_URL` 后走 Webhook，不再轮询。容器内监听 `0.0.0.0:8080`，Compose 默认只把端口发布到宿主机 `127.0.0.1`，由 TLS 反代（Caddy / Nginx / Cloudflare Tunnel）对外提供服务。
 
 ```
 WEBHOOK_URL=https://bot.example.com/telegram
-WEBHOOK_SECRET=long-random-string
+WEBHOOK_SECRET=replace_with_at_least_32_random_characters
 ```
 
 未设置 `WEBHOOK_URL` 时使用 long polling。
+
+生产环境请保持 `WEBHOOK_BIND=127.0.0.1`，并确认反向代理保留 Telegram 的 `X-Telegram-Bot-Api-Secret-Token` 请求头。可用 `openssl rand -hex 32` 生成符合要求的随机 secret。
+
+Webhook 的请求体只有 Update JSON，不包含上传文件本体；建议反代仅转发配置的 webhook path、其他路径直接拒绝，并在该 location 将请求体上限设为 `1m`，避免未认证的大请求占用内存。
 
 ## 环境变量
 
@@ -56,17 +63,25 @@ WEBHOOK_SECRET=long-random-string
 | `ADMIN_IDS` | 管理员用户 ID，逗号分隔 |
 | `ADMIN_CHAT_ID` | 可选。群/超级群 ID。论坛群会按用户建主题 |
 | `WEBHOOK_URL` | 可选。公网 HTTPS 地址，设置后启用 webhook |
-| `WEBHOOK_LISTEN` | 默认 `0.0.0.0` |
+| `WEBHOOK_LISTEN` | 容器内监听地址，默认 `0.0.0.0` |
+| `WEBHOOK_BIND` | Compose 宿主机发布地址，默认 `127.0.0.1` |
 | `WEBHOOK_PORT` | 默认 `8080`。Docker Compose 下这是**宿主机**映射端口，容器内进程固定监听 `8080` |
 | `WEBHOOK_PATH` | 默认 `/telegram`（若 URL 里已有 path 则用 URL） |
-| `WEBHOOK_SECRET` | 可选。Telegram `secret_token` |
+| `WEBHOOK_SECRET` | Webhook 必填。32–256 位，仅允许字母、数字、`_`、`-` |
 | `DATABASE_PATH` | 默认 `data/bot.db` |
 | `TZ` | 默认 `Asia/Shanghai` |
 | `LOG_LEVEL` | 默认 `INFO` |
+| `MAX_CONCURRENT_UPDATES` | 同时处理的更新数，默认 `16`，范围 `1`–`64` |
+| `UPDATE_QUEUE_SIZE` | 内存更新队列上限，默认 `256`，范围 `16`–`10000` |
+| `WEBHOOK_MAX_CONNECTIONS` | Telegram webhook 最大并发连接数，默认 `10`，范围 `1`–`100` |
+| `GLOBAL_RATE_LIMIT_COUNT` | 全局更新预算，默认 `120`；设为 `0` 可关闭 |
+| `GLOBAL_RATE_LIMIT_WINDOW` | 全局更新预算时间窗（秒），默认 `60` |
+| `MESSAGE_MAP_RETENTION_DAYS` | 回复映射保留天数，默认 `90` |
+| `BOT_IMAGE` | Compose 镜像引用；生产环境可填写不可变 digest |
 
 ## 管理员
 
-发送 `/admin`。界面语言在「界面」里切换。论坛主题开关也在那里。
+在管理员私聊或配置的收件箱中发送 `/admin`。界面语言在「界面」里切换。论坛主题开关也在那里；管理命令在其他群聊中不会响应。
 
 | 命令 | 说明 |
 | --- | --- |
@@ -90,7 +105,7 @@ Python 3.12+。
 ```bash
 python -m venv .venv
 .venv\Scripts\activate
-pip install -r requirements.txt
+pip install -r requirements-dev.txt
 cp .env.example .env
 python -m app
 ```

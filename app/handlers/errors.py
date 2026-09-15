@@ -21,7 +21,7 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         try:
             await notify_admins(context, f"内部错误：{type(err).__name__}")
         except Exception:
-            pass
+            log.exception("failed to notify admins about an unhandled error")
 
 
 def ctx_has_db(context: ContextTypes.DEFAULT_TYPE) -> bool:

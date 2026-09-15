@@ -14,22 +14,13 @@ async def check_and_hit(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> tup
     settings = ctx.settings_svc(context).current
     database = ctx.db(context)
     ts = now_ts()
-    user = await database.get_user(user_id)
-    if user and user.muted_until > ts:
-        return False, user.muted_until - ts
-
-    if not settings.rate_limit_enabled:
-        return True, 0
-
     window = max(1, settings.rate_limit_window)
-    limit = max(1, settings.rate_limit_count)
-    since = ts - window
-    await database.prune_rate_events(ts - max(window * 4, 3600))
-    count = await database.count_rate_events(user_id, since)
-    if count >= limit:
-        mute = max(1, settings.rate_limit_mute)
-        await database.set_flags(user_id, muted_until=ts + mute)
-        return False, mute
-
-    await database.add_rate_event(user_id, ts)
-    return True, 0
+    return await database.admit_rate_event(
+        user_id,
+        ts=ts,
+        enabled=settings.rate_limit_enabled,
+        window=window,
+        limit=max(1, settings.rate_limit_count),
+        mute=max(1, settings.rate_limit_mute),
+        prune_before=ts - max(window * 4, 3600),
+    )

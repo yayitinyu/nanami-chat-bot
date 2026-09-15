@@ -1,13 +1,20 @@
 from __future__ import annotations
 
 import html
+import ipaddress
 import re
+import unicodedata
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
-from zoneinfo import ZoneInfo
+from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+import idna
+import regex
 
 if TYPE_CHECKING:
-    from telegram import Message, User as TgUser
+    from telegram import Message
+    from telegram import User as TgUser
 
     from app.models import User
 
@@ -19,19 +26,29 @@ def set_timezone(name: str) -> None:
     TZ_NAME = name or "Asia/Shanghai"
 
 URL_RE = re.compile(
-    r"(?i)\b(?:https?://|www\.)[^\s<>\[\]()]+"
-    r"|(?:t\.me|telegram\.me|telegram\.dog)/[^\s<>\[\]()]+"
+    r"(?i)\b(?:https?|ftp|tg)://[^\s<>\[\]()]+"
+    r"|\b(?:www\.|t\.me/|telegram\.me/|telegram\.dog/)[^\s<>\[\]()]+"
+    r"|\bmailto:[^\s<>\[\]()]+"
 )
 
-BARE_DOMAIN_RE = re.compile(
-    r"(?i)\b(?:[a-z0-9-]+\.)+(?:com|net|org|xyz|top|info|io|cc|me|co|cn|ru|"
-    r"tk|ml|ga|cf|gq|shop|vip|club|online|site|click|pro|biz|tv|gg|dev|"
-    r"app|link|live|news|store|icu|cyou|sbs|bond|cfd|rest|quest|zip)\b"
+BARE_HOST_RE = regex.compile(
+    r"(?iu)(?<![\w@])(?:"
+    r"(?:\d{1,3}\.){3}\d{1,3}"
+    r"|\[[0-9a-f:]+\]"
+    r"|(?:(?:[^\W_]|-)+\.)+[^\W\d_](?:[^\W_]|-){1,62}"
+    r")(?:\:\d{1,5})?(?:/[^\s<>\[\]()]*)?"
 )
 
 MENTION_RE = re.compile(r"(?<!\w)@([a-zA-Z][a-zA-Z0-9_]{3,31})")
 
-DURATION_RE = re.compile(r"^\s*(\d+)\s*([smhdw]?)\s*$", re.IGNORECASE)
+DURATION_RE = re.compile(r"^\s*([0-9]{1,9})\s*([smhdw]?)\s*$", re.IGNORECASE)
+MAX_DURATION_SECONDS = 365 * 86400
+MAX_TELEGRAM_USER_ID = 2**63 - 1
+LINK_SCAN_TIMEOUT = 0.01
+_DOT_TRANSLATION = str.maketrans({"。": ".", "．": ".", "｡": "."})
+_IGNORABLE_FOR_MODERATION = str.maketrans(
+    {ord(ch): None for ch in ("\u00ad", "\u180e", "\u200b", "\u2060", "\ufeff")}
+)
 
 _UNITS = {
     "s": 1,
@@ -43,10 +60,14 @@ _UNITS = {
 }
 
 
+class LinkScanTimeout(ValueError):
+    pass
+
+
 def tz() -> ZoneInfo:
     try:
         return ZoneInfo(TZ_NAME)
-    except Exception:
+    except (ZoneInfoNotFoundError, ValueError):
         return ZoneInfo("UTC")
 
 
@@ -61,10 +82,13 @@ def today_key() -> str:
 def format_ts(ts: int | None) -> str:
     if not ts:
         return "-"
-    return datetime.fromtimestamp(ts, tz()).strftime("%Y-%m-%d %H:%M")
+    try:
+        return datetime.fromtimestamp(ts, tz()).strftime("%Y-%m-%d %H:%M")
+    except (OverflowError, OSError, ValueError):
+        return "-"
 
 
-def parse_duration(text: str) -> int | None:
+def parse_duration(text: str, *, max_seconds: int = MAX_DURATION_SECONDS) -> int | None:
     """Parse '30s' / '5m' / '2h' / '1d' / '1w'. Bare numbers are minutes."""
     match = DURATION_RE.match(text or "")
     if not match:
@@ -72,7 +96,15 @@ def parse_duration(text: str) -> int | None:
     amount = int(match.group(1))
     unit = match.group(2).lower()
     seconds = amount * _UNITS[unit]
-    return seconds if seconds > 0 else None
+    return seconds if 0 < seconds <= max_seconds else None
+
+
+def parse_telegram_user_id(value: str) -> int | None:
+    text = (value or "").strip()
+    if not text.isascii() or not text.isdigit() or len(text) > 19:
+        return None
+    user_id = int(text)
+    return user_id if 1 <= user_id <= MAX_TELEGRAM_USER_ID else None
 
 
 def format_duration(seconds: int) -> str:
@@ -85,24 +117,45 @@ def escape(text: str | None) -> str:
     return html.escape(text or "", quote=True)
 
 
+def _without_format_controls(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", value or "")
+    normalized = normalized.translate(_IGNORABLE_FOR_MODERATION)
+    return "".join(ch for ch in normalized if unicodedata.category(ch) != "Cf")
+
+
+def moderation_text(value: str) -> str:
+    """Build a comparison-only form without changing relayed user content."""
+    return _without_format_controls(value).casefold()
+
+
+def display_text(value: str | None) -> str:
+    """Collapse unsafe/invisible controls in untrusted UI labels."""
+    normalized = unicodedata.normalize("NFKC", value or "")
+    visible = "".join(
+        " " if unicodedata.category(ch) in {"Cc", "Cf", "Cs"} else ch
+        for ch in normalized
+    )
+    return " ".join(visible.split())
+
+
 def display_name(user: User | TgUser) -> str:
-    first = getattr(user, "first_name", None) or ""
-    last = getattr(user, "last_name", None) or ""
+    first = display_text(getattr(user, "first_name", None))
+    last = display_text(getattr(user, "last_name", None))
     name = " ".join(p for p in (first, last) if p).strip()
     if name:
         return name
     username = getattr(user, "username", None)
     if username:
-        return f"@{username}"
+        return f"@{display_text(username)}"
     user_id = getattr(user, "user_id", None) or getattr(user, "id", None)
     return str(user_id or "")
 
 
 def user_header(user: User | TgUser, extra: str = "") -> str:
     name = escape(display_name(user))
-    username = getattr(user, "username", None)
+    username = display_text(getattr(user, "username", None))
     uname = f" @{escape(username)}" if username else ""
-    user_id = getattr(user, "user_id", None) or getattr(user, "id")
+    user_id = getattr(user, "user_id", None) or getattr(user, "id", None)
     lines = [f"👤 <b>{name}</b>{uname}", f"ID: <code>{user_id}</code>"]
     if extra:
         lines.append(extra)
@@ -112,8 +165,13 @@ def user_header(user: User | TgUser, extra: str = "") -> str:
 def extract_urls(text: str) -> list[str]:
     if not text:
         return []
-    found = URL_RE.findall(text)
-    found.extend(BARE_DOMAIN_RE.findall(text))
+    normalized = _without_format_controls(text).translate(_DOT_TRANSLATION)
+    found = URL_RE.findall(normalized)
+    try:
+        bare_hosts = BARE_HOST_RE.findall(normalized, timeout=LINK_SCAN_TIMEOUT)
+    except TimeoutError as exc:
+        raise LinkScanTimeout("bare-host scan exceeded its deadline") from exc
+    found.extend(item for item in bare_hosts if normalize_domain(item))
     # Deduplicate while preserving order
     seen: set[str] = set()
     result: list[str] = []
@@ -132,29 +190,68 @@ def extract_mentions(text: str) -> list[str]:
 
 
 def normalize_domain(value: str) -> str:
-    value = value.strip().lower()
-    value = re.sub(r"^https?://", "", value)
-    value = value.split("/")[0]
-    value = value.split("?")[0]
-    if ":" in value and not value.count(":") > 1:
-        host, port = value.rsplit(":", 1)
-        if port.isdigit():
-            value = host
-    if value.startswith("www."):
-        value = value[4:]
-    return value
+    raw = _without_format_controls(value).translate(_DOT_TRANSLATION).strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urlsplit(raw if "://" in raw else f"//{raw}")
+        host = parsed.hostname
+    except ValueError:
+        return ""
+    if not host:
+        return ""
+    host = host.rstrip(".").lower()
+    host = host.removeprefix("www.")
+    try:
+        return str(ipaddress.ip_address(host))
+    except ValueError:
+        pass
+    try:
+        ascii_host = idna.encode(host, uts46=True, std3_rules=True).decode("ascii")
+    except idna.IDNAError:
+        return ""
+    if len(ascii_host) > 253 or "." not in ascii_host:
+        return ""
+    labels = ascii_host.split(".")
+    if any(
+        not label
+        or len(label) > 63
+        or label.startswith("-")
+        or label.endswith("-")
+        or not re.fullmatch(r"[a-z0-9-]+", label)
+        for label in labels
+    ):
+        return ""
+    if labels[-1].isdigit():
+        return ""
+    return ascii_host
+
+
+def is_valid_domain(value: str) -> bool:
+    raw = _without_format_controls(value).translate(_DOT_TRANSLATION).strip()
+    try:
+        parsed = urlsplit(raw if "://" in raw else f"//{raw}")
+    except ValueError:
+        return False
+    return parsed.username is None and parsed.password is None and bool(
+        normalize_domain(value)
+    )
 
 
 def domain_matches(domain: str, allowlist: list[str]) -> bool:
     domain = normalize_domain(domain)
+    if not domain:
+        return False
     for allowed in allowlist:
         allowed = normalize_domain(allowed)
-        if domain == allowed or domain.endswith("." + allowed):
+        if allowed and (domain == allowed or domain.endswith("." + allowed)):
             return True
     return False
 
 
 def is_telegram_link(url: str) -> bool:
+    if (url or "").strip().lower().startswith("tg:"):
+        return True
     host = normalize_domain(url)
     return host in {"t.me", "telegram.me", "telegram.dog", "telegram.org"} or host.endswith(
         ".t.me"

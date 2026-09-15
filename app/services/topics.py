@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 
 from telegram.error import BadRequest, TelegramError
 from telegram.ext import ContextTypes
@@ -10,17 +9,17 @@ from telegram.ext import ContextTypes
 from app import ctx
 from app.models import User
 from app.texts import user_card
+from app.utils import display_name, display_text
 
 log = logging.getLogger(__name__)
 
 GENERAL_TOPIC_ID = 1
 TOPIC_COLORS = (0x6FB9F0, 0xFFD67E, 0xCB86DB, 0x8EEE98, 0xFF93B2, 0xFB6F5F)
-_UNSAFE = re.compile(r"[\n\r]+")
 
 
 def topic_title(user: User) -> str:
-    name = _UNSAFE.sub(" ", user.full_name).strip() or str(user.user_id)
-    suffix = f" (@{user.username})" if user.username else ""
+    name = display_name(user) or str(user.user_id)
+    suffix = f" (@{display_text(user.username)})" if user.username else ""
     prefix = f"{user.user_id} · "
     budget = 128 - len(prefix) - len(suffix)
     if budget < 1:

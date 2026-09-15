@@ -9,21 +9,47 @@ from telegram.ext import ContextTypes
 from app import ctx, keyboards, texts
 from app.handlers import admin_await, panels
 from app.handlers.admin_reply import on_admin_reply
-from app.handlers.common import clear_await, safe_reply, set_await
+from app.handlers.common import admit_global_update, clear_await, safe_reply, set_await
 from app.i18n import t
-from app.models import MEDIA_TYPES
+from app.models import LANG_LABELS, MEDIA_TYPES
 from app.services.broadcast import deliver, schedule, unschedule
 from app.services.topics import is_user_topic
-
+from app.utils import parse_telegram_user_id
 
 log = logging.getLogger(__name__)
+MAX_SQLITE_ID = 2**63 - 1
+
+
+class MalformedCallback(ValueError):
+    pass
+
+
+def _callback_uint(value: str, *, allow_zero: bool = False) -> int:
+    if not value.isascii() or not value.isdigit() or len(value) > 19:
+        raise MalformedCallback
+    result = int(value)
+    minimum = 0 if allow_zero else 1
+    if not minimum <= result <= MAX_SQLITE_ID:
+        raise MalformedCallback
+    return result
+
+
+def _admin_surface_allowed(message, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    if message is None:
+        return False
+    chat = getattr(message, "chat", None)
+    if chat is None:
+        return False
+    if getattr(chat, "type", None) == "private":
+        return True
+    return getattr(chat, "id", None) == ctx.config(context).admin_chat_id
 
 
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    clear_await(context)
     message = update.effective_message
-    if not message:
+    if not _admin_surface_allowed(message, context):
         return
+    clear_await(context)
     database = ctx.db(context)
     total = await database.count_users()
     banned = await database.count_users(banned_only=True)
@@ -38,11 +64,12 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if not _admin_surface_allowed(message, context):
+        return
     clear_await(context)
     context.user_data.pop("bc_draft", None)
-    message = update.effective_message
-    if message:
-        await safe_reply(message, t("msg.cancelled", ctx.admin_lang(update, context)))
+    await safe_reply(message, t("msg.cancelled", ctx.admin_lang(update, context)))
 
 
 async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -55,15 +82,15 @@ async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def _ban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, banned: bool) -> None:
     message = update.effective_message
-    if not message:
+    if not _admin_surface_allowed(message, context):
         return
     database = ctx.db(context)
     user_id = None
     if context.args:
         found = await database.find_user(" ".join(context.args))
         user_id = found.user_id if found else None
-        if user_id is None and context.args[0].lstrip("-").isdigit():
-            user_id = int(context.args[0])
+        if user_id is None:
+            user_id = parse_telegram_user_id(context.args[0])
     elif message.reply_to_message:
         mapped = await database.map_by_admin(message.chat_id, message.reply_to_message.message_id)
         if mapped:
@@ -92,10 +119,8 @@ async def _ban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, banned: b
 
 async def on_admin_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
-    if message and message.chat.type != "private":
-        inbox = ctx.config(context).admin_chat_id
-        if inbox is None or message.chat.id != inbox:
-            return
+    if not _admin_surface_allowed(message, context):
+        return
     if await admin_await.handle(update, context):
         return
     if message and (message.reply_to_message or is_user_topic(message.message_thread_id)):
@@ -111,11 +136,22 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not query or not query.data or not user:
         return
     data = query.data
+    if not ctx.admins(context).is_admin(user.id):
+        if context.user_data.get("not_admin_callback_warned"):
+            return
+        if not await admit_global_update(context):
+            return
+        context.user_data["not_admin_callback_warned"] = True
+        await query.answer(
+            t("msg.not_admin", ctx.admin_lang(update, context)), show_alert=True
+        )
+        return
+    context.user_data.pop("not_admin_callback_warned", None)
+    if not _admin_surface_allowed(query.message, context):
+        await query.answer(t("msg.not_admin", ctx.admin_lang(update, context)), show_alert=True)
+        return
     if data == "noop":
         await query.answer()
-        return
-    if not ctx.admins(context).is_admin(user.id):
-        await query.answer(t("msg.not_admin", ctx.admin_lang(update, context)), show_alert=True)
         return
 
     if data == "m:close":
@@ -149,7 +185,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "ui": _ui,
     }.get(prefix)
     if router:
-        await router(query, context, rest)
+        try:
+            await router(query, context, rest)
+        except MalformedCallback:
+            log.warning("ignored malformed admin callback with prefix %s", prefix)
 
 
 async def _show(data: str, query, context) -> None:
@@ -170,8 +209,10 @@ async def _users(query, context, rest: str) -> None:
     parts = rest.split(":")
     cmd = parts[0]
     if cmd == "p":
-        page = int(parts[1]) if len(parts) > 1 else 0
-        banned_only = bool(int(parts[2])) if len(parts) > 2 else False
+        page = _callback_uint(parts[1], allow_zero=True) if len(parts) > 1 else 0
+        if len(parts) > 2 and parts[2] not in {"0", "1"}:
+            raise MalformedCallback
+        banned_only = parts[2] == "1" if len(parts) > 2 else False
         await panels.show_users(query, context, page=page, banned_only=banned_only)
         return
     if cmd == "search":
@@ -180,10 +221,10 @@ async def _users(query, context, rest: str) -> None:
             await query.message.reply_text(t("prompt.search", ctx.lang_from_query(query, context)))
         return
     if cmd == "id" and len(parts) > 1:
-        await panels.show_user(query, context, int(parts[1]))
+        await panels.show_user(query, context, _callback_uint(parts[1]))
         return
     if cmd in {"ban", "unban"} and len(parts) > 1:
-        user_id = int(parts[1])
+        user_id = _callback_uint(parts[1])
         await ctx.db(context).set_flags(user_id, is_banned=cmd == "ban")
         if cmd == "ban":
             try:
@@ -197,14 +238,15 @@ async def _users(query, context, rest: str) -> None:
         await panels.show_user(query, context, user_id)
         return
     if cmd == "msg" and len(parts) > 1:
-        set_await(context, "user_msg", user_id=int(parts[1]))
+        set_await(context, "user_msg", user_id=_callback_uint(parts[1]))
         if query.message:
             await query.message.reply_text(t("prompt.user_msg", ctx.lang_from_query(query, context)))
         return
     if cmd == "cap" and len(parts) > 1:
-        await ctx.db(context).set_flags(int(parts[1]), captcha_passed=False)
-        await ctx.db(context).delete_captcha(int(parts[1]))
-        await panels.show_user(query, context, int(parts[1]))
+        user_id = _callback_uint(parts[1])
+        await ctx.db(context).set_flags(user_id, captcha_passed=False)
+        await ctx.db(context).delete_captcha(user_id)
+        await panels.show_user(query, context, user_id)
 
 
 async def _start_msg(query, context, rest: str) -> None:
@@ -255,8 +297,12 @@ async def _captcha(query, context, rest: str) -> None:
     if rest == "toggle":
         await svc.toggle("captcha_enabled")
     elif rest == "type":
-        current = svc.current.captcha_type
-        await svc.update(captcha_type="math" if current == "button" else "button")
+        def toggle_type(settings) -> None:
+            settings.captcha_type = (
+                "math" if settings.captcha_type == "button" else "button"
+            )
+
+        await svc.mutate(toggle_type)
     elif rest == "ban":
         await svc.toggle("captcha_ban_on_fail")
     await panels.show_captcha(query, context)
@@ -295,7 +341,9 @@ async def _keyword_filter(query, context, rest: str) -> None:
             await query.message.reply_text(t("prompt.filter_kw", ctx.lang_from_query(query, context)))
         return
     elif rest.startswith("del:"):
-        await ctx.db(context).delete_filter_keyword(int(rest.split(":")[1]))
+        await ctx.db(context).delete_filter_keyword(
+            _callback_uint(rest.split(":", 1)[1])
+        )
     await panels.show_keyword_filter(query, context)
 
 
@@ -305,12 +353,18 @@ async def _language(query, context, rest: str) -> None:
         await svc.toggle("language_filter_enabled")
     else:
         code = rest
-        langs = list(svc.current.allowed_languages)
-        if code in langs:
-            langs = [c for c in langs if c != code]
-        else:
-            langs.append(code)
-        await svc.update(allowed_languages=langs)
+        if code not in LANG_LABELS:
+            raise MalformedCallback
+
+        def toggle_language(settings) -> None:
+            langs = list(settings.allowed_languages)
+            if code in langs:
+                langs = [item for item in langs if item != code]
+            else:
+                langs.append(code)
+            settings.allowed_languages = langs
+
+        await svc.mutate(toggle_language)
     await panels.show_language(query, context)
 
 
@@ -319,12 +373,15 @@ async def _media(query, context, rest: str) -> None:
     if rest == "toggle":
         await svc.toggle("media_filter_enabled")
     elif rest in MEDIA_TYPES:
-        blocked = list(svc.current.blocked_media)
-        if rest in blocked:
-            blocked = [x for x in blocked if x != rest]
-        else:
-            blocked.append(rest)
-        await svc.update(blocked_media=blocked)
+        def toggle_media(settings) -> None:
+            blocked = list(settings.blocked_media)
+            if rest in blocked:
+                blocked = [item for item in blocked if item != rest]
+            else:
+                blocked.append(rest)
+            settings.blocked_media = blocked
+
+        await svc.mutate(toggle_media)
     await panels.show_media(query, context)
 
 
@@ -342,7 +399,9 @@ async def _link(query, context, rest: str) -> None:
             await query.message.reply_text(t("prompt.domain", ctx.lang_from_query(query, context)))
         return
     elif rest.startswith("del:"):
-        await ctx.db(context).delete_allow_domain(int(rest.split(":")[1]))
+        await ctx.db(context).delete_allow_domain(
+            _callback_uint(rest.split(":", 1)[1])
+        )
     await panels.show_link(query, context)
 
 
@@ -356,9 +415,9 @@ async def _auto_reply(query, context, rest: str) -> None:
     if rest == "silent":
         await ctx.settings_svc(context).toggle("auto_reply_silent")
     elif rest.startswith("tg:"):
-        await database.toggle_auto_reply(int(rest.split(":")[1]))
+        await database.toggle_auto_reply(_callback_uint(rest.split(":", 1)[1]))
     elif rest.startswith("del:"):
-        await database.delete_auto_reply(int(rest.split(":")[1]))
+        await database.delete_auto_reply(_callback_uint(rest.split(":", 1)[1]))
     await panels.show_auto_reply(query, context)
 
 
@@ -376,7 +435,16 @@ async def _broadcast(query, context, rest: str) -> None:
         return
     if rest.startswith("go:"):
         token = rest.split(":", 1)[1]
-        interval = None if token == "now" else int(token)
+        intervals = {
+            "now": None,
+            "3600": 3600,
+            "21600": 21600,
+            "86400": 86400,
+            "604800": 604800,
+        }
+        if token not in intervals:
+            raise MalformedCallback
+        interval = intervals[token]
         message = query.message
         if message is None:
             return
@@ -393,7 +461,7 @@ async def _broadcast(query, context, rest: str) -> None:
         await panels.show_broadcast(query, context)
         return
     if rest.startswith("tg:"):
-        item_id = int(rest.split(":")[1])
+        item_id = _callback_uint(rest.split(":", 1)[1])
         item = await database.get_broadcast(item_id)
         if item:
             enabled = not item.is_enabled
@@ -405,7 +473,7 @@ async def _broadcast(query, context, rest: str) -> None:
             else:
                 unschedule(context.application, item_id)
     elif rest.startswith("run:"):
-        item_id = int(rest.split(":")[1])
+        item_id = _callback_uint(rest.split(":", 1)[1])
         item = await database.get_broadcast(item_id)
         if item and query.message:
             await deliver(
@@ -415,7 +483,7 @@ async def _broadcast(query, context, rest: str) -> None:
                 lang=ctx.lang_from_query(query, context),
             )
     elif rest.startswith("del:"):
-        item_id = int(rest.split(":")[1])
+        item_id = _callback_uint(rest.split(":", 1)[1])
         unschedule(context.application, item_id)
         await database.delete_broadcast(item_id)
     await panels.show_broadcast(query, context)
@@ -433,7 +501,7 @@ async def _admins(query, context, rest: str) -> None:
             await query.message.reply_text(t("prompt.add_admin", ctx.lang_from_query(query, context)))
         return
     if rest.startswith("del:"):
-        uid = int(rest.split(":")[1])
+        uid = _callback_uint(rest.split(":", 1)[1])
         if not store.is_super_admin(query.from_user.id if query.from_user else None):
             if query.message:
                 await query.message.reply_text(t("msg.not_admin", ctx.lang_from_query(query, context)))
@@ -446,6 +514,8 @@ async def _ui(query, context, rest: str) -> None:
     svc = ctx.settings_svc(context)
     if rest.startswith("lang:"):
         code = rest.split(":", 1)[1]
+        if code not in {"auto", "zh", "en", "ja"}:
+            raise MalformedCallback
         await svc.update(ui_language=code)
     elif rest == "forum":
         await svc.toggle("forum_topics_enabled")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from string import Formatter
 from typing import Any
 
 UI_LANGS = ("zh", "en", "ja")
@@ -56,7 +57,7 @@ STRINGS: dict[str, dict[str, str]] = {
         "user.status.muted": "限流至 {until}",
         "user.status.unverified": "未验证",
         "user.status.ok": "正常",
-        "user.card": "<b>{name}</b>  {uname}\nID: <code>{id}</code>\n状态：{status}\n语言：{lang}\n注册：{created}\n活跃：{seen}\n消息：{count}{notes}",
+        "user.card": "<b>{name}</b>  {uname}\nID: <code>{id}</code>\n状态：{status}\n语言：{language}\n注册：{created}\n活跃：{seen}\n消息：{count}{notes}",
         "user.notes": "\n备注：{notes}",
         "start.title": "<b>启动消息</b>",
         "start.help": "支持 HTML。点「修改」后发送新内容，点「预览」查看渲染效果。",
@@ -122,7 +123,7 @@ STRINGS: dict[str, dict[str, str]] = {
         "captcha.bad": "验证失败，请重试。",
         "captcha.expired": "验证已过期，请发送 /start 重新开始。",
         "captcha.fail_ban": "验证失败次数过多，已被禁止使用。",
-        "captcha.timeout": "验证超时，请发送 /start 重新开始。",
+        "captcha.timed_out": "验证超时，请发送 /start 重新开始。",
         "captcha.pending": "请先完成上方的验证。",
         "msg.cancelled": "已取消。",
         "msg.await": "发送内容，或 /cancel 取消。",
@@ -140,7 +141,7 @@ STRINGS: dict[str, dict[str, str]] = {
         "msg.admin_hint": "管理员请使用 /admin",
         "msg.reply_hint": "引用消息回复用户，或在用户主题中直接回复，或使用 /admin",
         "msg.ban_usage": "用法：/ban 用户ID 或引用消息。",
-        "msg.html_invalid": "HTML 无效，已按纯文本保存。",
+        "msg.html_invalid": "HTML 无效，未保存，请重试。",
         "msg.duration_hint": "用 30s / 5m / 1h 这种格式。",
         "msg.interval_min": "最短 1 分钟，例如 30m / 2h / 1d。",
         "prompt.search": "发送用户 ID 或用户名。",
@@ -230,7 +231,7 @@ STRINGS: dict[str, dict[str, str]] = {
         "user.status.muted": "muted until {until}",
         "user.status.unverified": "unverified",
         "user.status.ok": "ok",
-        "user.card": "<b>{name}</b>  {uname}\nID: <code>{id}</code>\nStatus: {status}\nLanguage: {lang}\nJoined: {created}\nSeen: {seen}\nMessages: {count}{notes}",
+        "user.card": "<b>{name}</b>  {uname}\nID: <code>{id}</code>\nStatus: {status}\nLanguage: {language}\nJoined: {created}\nSeen: {seen}\nMessages: {count}{notes}",
         "user.notes": "\nNotes: {notes}",
         "start.title": "<b>Start message</b>",
         "start.help": "HTML supported. Tap Edit, then send the new text. Preview renders it.",
@@ -296,7 +297,7 @@ STRINGS: dict[str, dict[str, str]] = {
         "captcha.bad": "Wrong, try again.",
         "captcha.expired": "Verification expired. Send /start again.",
         "captcha.fail_ban": "Too many failed attempts. You are banned.",
-        "captcha.timeout": "Verification timed out. Send /start again.",
+        "captcha.timed_out": "Verification timed out. Send /start again.",
         "captcha.pending": "Please complete the verification above first.",
         "msg.cancelled": "Cancelled.",
         "msg.await": "Send the content, or /cancel.",
@@ -314,7 +315,7 @@ STRINGS: dict[str, dict[str, str]] = {
         "msg.admin_hint": "Admins: use /admin",
         "msg.reply_hint": "Quote a user message, reply in their topic, or use /admin",
         "msg.ban_usage": "Usage: /ban USER_ID or quote a message.",
-        "msg.html_invalid": "Invalid HTML; saved as plain text.",
+        "msg.html_invalid": "Invalid HTML; not saved. Try again.",
         "msg.duration_hint": "Use 30s / 5m / 1h.",
         "msg.interval_min": "Minimum 1 minute, e.g. 30m / 2h / 1d.",
         "prompt.search": "Send a user ID or username.",
@@ -404,7 +405,7 @@ STRINGS: dict[str, dict[str, str]] = {
         "user.status.muted": "{until} まで制限",
         "user.status.unverified": "未認証",
         "user.status.ok": "正常",
-        "user.card": "<b>{name}</b>  {uname}\nID: <code>{id}</code>\n状態：{status}\n言語：{lang}\n登録：{created}\n最終：{seen}\nメッセージ：{count}{notes}",
+        "user.card": "<b>{name}</b>  {uname}\nID: <code>{id}</code>\n状態：{status}\n言語：{language}\n登録：{created}\n最終：{seen}\nメッセージ：{count}{notes}",
         "user.notes": "\nメモ：{notes}",
         "start.title": "<b>開始メッセージ</b>",
         "start.help": "HTML 対応。「編集」のあと新しい内容を送信。「プレビュー」で確認。",
@@ -470,7 +471,7 @@ STRINGS: dict[str, dict[str, str]] = {
         "captcha.bad": "違います。もう一度。",
         "captcha.expired": "認証の期限切れです。/start を送ってください。",
         "captcha.fail_ban": "失敗が多すぎます。利用を禁止しました。",
-        "captcha.timeout": "認証がタイムアウトしました。/start を送ってください。",
+        "captcha.timed_out": "認証がタイムアウトしました。/start を送ってください。",
         "captcha.pending": "先に上の認証を完了してください。",
         "msg.cancelled": "キャンセルしました。",
         "msg.await": "内容を送るか、/cancel。",
@@ -488,7 +489,7 @@ STRINGS: dict[str, dict[str, str]] = {
         "msg.admin_hint": "管理者は /admin を使ってください",
         "msg.reply_hint": "メッセージを引用するか、ユーザートピックで返信するか、/admin",
         "msg.ban_usage": "使い方：/ban ユーザーID、または引用。",
-        "msg.html_invalid": "HTML が無効です。プレーンテキストとして保存しました。",
+        "msg.html_invalid": "HTML が無効です。保存せず、再入力を待っています。",
         "msg.duration_hint": "30s / 5m / 1h の形式で。",
         "msg.interval_min": "最短 1 分。例：30m / 2h / 1d。",
         "prompt.search": "ユーザー ID かユーザー名を送ってください。",
@@ -576,8 +577,30 @@ def media_label(kind: str, lang: str | None = None) -> str:
 
 def assert_complete() -> None:
     keys = set(STRINGS[FALLBACK])
+    formatter = Formatter()
+    reserved = {"key", "lang"}
     for lang, table in STRINGS.items():
         missing = keys - set(table)
         extra = set(table) - keys
         if missing or extra:
             raise AssertionError(f"{lang} missing={sorted(missing)} extra={sorted(extra)}")
+        for key, template in table.items():
+            fields = {
+                field_name
+                for _, field_name, _, _ in formatter.parse(template)
+                if field_name
+            }
+            fallback_fields = {
+                field_name
+                for _, field_name, _, _ in formatter.parse(STRINGS[FALLBACK][key])
+                if field_name
+            }
+            if fields != fallback_fields:
+                raise AssertionError(
+                    f"{lang}.{key} placeholders={sorted(fields)} "
+                    f"expected={sorted(fallback_fields)}"
+                )
+            if fields & reserved:
+                raise AssertionError(
+                    f"{lang}.{key} uses reserved placeholders={sorted(fields & reserved)}"
+                )

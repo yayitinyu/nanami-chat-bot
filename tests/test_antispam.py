@@ -2,7 +2,11 @@ from types import SimpleNamespace
 
 from app.models import MATCH_EXACT, MATCH_REGEX, AutoReply, BotSettings
 from app.services.antispam import check_message, keyword_hit
-from app.services.auto_reply import match_auto_reply, parse_keyword_line
+from app.services.auto_reply import (
+    match_auto_reply,
+    parse_keyword_line,
+    valid_auto_reply_keyword,
+)
 from app.services.language import detect_language
 
 
@@ -33,6 +37,9 @@ def test_keyword_hit() -> None:
     assert keyword_hit("免费加微 123", ["加微", "空投"]) == "加微"
     assert keyword_hit("hello", ["加微"]) is None
     assert keyword_hit("FREE AIRDROP", ["airdrop"]) == "airdrop"
+    assert keyword_hit("ｓｐａｍ", ["spam"]) == "spam"
+    assert keyword_hit("加\u200b微", ["加微"]) == "加微"
+    assert keyword_hit("加\u200d微", ["加微"]) == "加微"
 
 
 def test_language_detection() -> None:
@@ -61,6 +68,18 @@ def test_parse_keyword_line() -> None:
     assert parse_keyword_line("exact:Hello") == ("exact", "Hello")
     assert parse_keyword_line("regex:^a+$") == ("regex", "^a+$")
     assert parse_keyword_line("价格") == ("contains", "价格")
+    assert valid_auto_reply_keyword(MATCH_REGEX, r"^a+$")
+    assert not valid_auto_reply_keyword(MATCH_REGEX, "(")
+    assert not valid_auto_reply_keyword(MATCH_REGEX, "a" * 257)
+
+
+def test_catastrophic_auto_reply_regex_is_time_bounded() -> None:
+    import time
+
+    rule = AutoReply(1, r"(a+)+$", MATCH_REGEX, "never", True)
+    started = time.monotonic()
+    assert match_auto_reply("a" * 4095 + "!", [rule]) is None
+    assert time.monotonic() - started < 0.5
 
 
 def test_link_filter_allowlist() -> None:
@@ -89,6 +108,106 @@ def test_link_filter_allowlist() -> None:
         allow_domains=[],
     )
     assert tme.ok is False
+
+    modern_tld = check_message(
+        _msg("visit spam.ai/path"),
+        settings,
+        filter_keywords=[],
+        allow_domains=[],
+    )
+    assert modern_tld.reason == "link"
+
+    ip_literal = check_message(
+        _msg("visit 192.0.2.10/login"),
+        settings,
+        filter_keywords=[],
+        allow_domains=[],
+    )
+    assert ip_literal.reason == "link"
+
+    invisible = check_message(
+        _msg("visit spam\u200b.ai/path"),
+        settings,
+        filter_keywords=[],
+        allow_domains=[],
+    )
+    assert invisible.reason == "link"
+
+    sharp_s = check_message(
+        _msg("visit faß.de"),
+        settings,
+        filter_keywords=[],
+        allow_domains=["fass.de"],
+    )
+    assert sharp_s.reason == "link"
+
+    hidden_link = check_message(
+        _msg(
+            "click here",
+            entities=[
+                SimpleNamespace(
+                    type="text_link",
+                    url="https://hidden.example/path",
+                    offset=0,
+                    length=10,
+                )
+            ],
+        ),
+        settings,
+        filter_keywords=[],
+        allow_domains=[],
+    )
+    assert hidden_link.reason == "link"
+
+    email = check_message(
+        _msg(
+            "spam@example.net",
+            entities=[
+                SimpleNamespace(type="email", url=None, offset=0, length=16)
+            ],
+        ),
+        settings,
+        filter_keywords=[],
+        allow_domains=[],
+    )
+    assert email.reason == "link"
+
+    mention_settings = BotSettings(
+        link_filter_enabled=True,
+        link_block_mentions=True,
+    )
+    hidden_mention = check_message(
+        _msg(
+            "contact me",
+            entities=[
+                SimpleNamespace(
+                    type="text_mention",
+                    url=None,
+                    offset=0,
+                    length=7,
+                )
+            ],
+        ),
+        mention_settings,
+        filter_keywords=[],
+        allow_domains=[],
+    )
+    assert hidden_mention.reason == "link"
+
+
+def test_pathological_bare_domain_scan_is_bounded_and_blocked() -> None:
+    import time
+
+    settings = BotSettings(link_filter_enabled=True)
+    started = time.monotonic()
+    verdict = check_message(
+        _msg("a." * 2048),
+        settings,
+        filter_keywords=[],
+        allow_domains=[],
+    )
+    assert verdict.reason == "link"
+    assert time.monotonic() - started < 0.2
 
 
 def test_media_and_keyword_and_language_filters() -> None:

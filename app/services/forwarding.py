@@ -10,7 +10,7 @@ from app import ctx
 from app.i18n import t
 from app.models import User
 from app.services.topics import send_to_topic, topics_enabled
-from app.utils import user_header
+from app.utils import escape, user_header
 
 log = logging.getLogger(__name__)
 
@@ -49,7 +49,6 @@ async def relay_user_message(
     note: str = "",
     lang: str = "zh",
 ) -> None:
-    database = ctx.db(context)
     destinations = ctx.inbox_chat_ids(context)
     header = user_header(user, note)
     use_topics = await topics_enabled(context)
@@ -92,7 +91,7 @@ async def relay_user_message(
                 user_message_id=message.message_id,
                 admin_chat_id=chat_id,
                 admin_message_id=header_msg.message_id,
-                direction="in",
+                direction="in_header",
             )
             await _map(
                 context,
@@ -160,7 +159,7 @@ async def relay_album(
                 user_message_id=first.message_id,
                 admin_chat_id=chat_id,
                 admin_message_id=header_msg.message_id,
-                direction="in",
+                direction="in_header",
             )
             last_id = header_msg.message_id
             for item in messages:
@@ -234,7 +233,7 @@ async def notify_filter(
     if not settings.notify_admin_on_filter:
         return
     label = t(f"admin_reason.{verdict_reason}", lang)
-    extra = f" · {detail}" if detail else ""
+    extra = f" · {escape(detail[:300])}" if detail else ""
     await notify_admins(
         context,
         t("intercept", lang, label=label, extra=extra, header=user_header(user)),

@@ -2,13 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import os
+import secrets
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 import aiosqlite
 
 from app.models import AutoReply, BotSettings, Broadcast, MessageMap, User
-from app.utils import now_ts
+from app.utils import now_ts, parse_telegram_user_id
+
+log = logging.getLogger(__name__)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -46,6 +52,7 @@ CREATE INDEX IF NOT EXISTS idx_map_admin
     ON message_map(admin_chat_id, admin_message_id);
 CREATE INDEX IF NOT EXISTS idx_map_user
     ON message_map(user_chat_id, user_message_id);
+CREATE INDEX IF NOT EXISTS idx_map_created ON message_map(created_at);
 
 CREATE TABLE IF NOT EXISTS auto_replies (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -90,6 +97,7 @@ CREATE TABLE IF NOT EXISTS rate_events (
     ts INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_rate_user_ts ON rate_events(user_id, ts);
+CREATE INDEX IF NOT EXISTS idx_rate_ts ON rate_events(ts);
 
 CREATE TABLE IF NOT EXISTS captcha_challenges (
     user_id INTEGER PRIMARY KEY,
@@ -97,6 +105,7 @@ CREATE TABLE IF NOT EXISTS captcha_challenges (
     tries INTEGER NOT NULL DEFAULT 0,
     expires_at INTEGER NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_captcha_expires ON captcha_challenges(expires_at);
 
 CREATE TABLE IF NOT EXISTS stats (
     day TEXT NOT NULL,
@@ -112,6 +121,7 @@ def _b(value: Any) -> bool:
 
 
 def _user_from_row(row: aiosqlite.Row) -> User:
+    keys = row.keys()
     return User(
         user_id=row["user_id"],
         username=row["username"],
@@ -127,8 +137,8 @@ def _user_from_row(row: aiosqlite.Row) -> User:
         message_count=row["message_count"],
         muted_until=row["muted_until"] or 0,
         notes=row["notes"],
-        forum_topic_id=row["forum_topic_id"] if "forum_topic_id" in row.keys() else None,
-        ui_lang=row["ui_lang"] if "ui_lang" in row.keys() else None,
+        forum_topic_id=row["forum_topic_id"] if "forum_topic_id" in keys else None,
+        ui_lang=row["ui_lang"] if "ui_lang" in keys else None,
     )
 
 
@@ -140,13 +150,36 @@ class Database:
 
     async def init(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._restrict_file_permissions()
         self._conn = await aiosqlite.connect(self.path)
+        self._restrict_file_permissions()
         self._conn.row_factory = aiosqlite.Row
         await self._conn.execute("PRAGMA journal_mode=WAL")
         await self._conn.execute("PRAGMA foreign_keys=ON")
         await self._conn.executescript(SCHEMA)
         await self._conn.commit()
+        self._restrict_file_permissions()
         await self._migrate()
+
+    def _restrict_file_permissions(self) -> None:
+        if os.name != "posix":
+            return
+        candidates = (
+            self.path,
+            Path(f"{self.path}-wal"),
+            Path(f"{self.path}-shm"),
+        )
+        for candidate in candidates:
+            if not candidate.exists():
+                continue
+            try:
+                os.chmod(candidate, 0o600)
+            except OSError as exc:
+                log.warning(
+                    "could not restrict permissions for %s: %s",
+                    candidate.name,
+                    exc,
+                )
 
     async def close(self) -> None:
         if self._conn is not None:
@@ -166,6 +199,14 @@ class Database:
             ON users(forum_topic_id) WHERE forum_topic_id IS NOT NULL
             """
         )
+        await self.execute(
+            "CREATE INDEX IF NOT EXISTS idx_map_created ON message_map(created_at)"
+        )
+        await self.execute("CREATE INDEX IF NOT EXISTS idx_rate_ts ON rate_events(ts)")
+        await self.execute(
+            "CREATE INDEX IF NOT EXISTS idx_captcha_expires "
+            "ON captcha_challenges(expires_at)"
+        )
 
     @property
     def conn(self) -> aiosqlite.Connection:
@@ -175,9 +216,13 @@ class Database:
 
     async def execute(self, sql: str, params: Iterable[Any] = ()) -> aiosqlite.Cursor:
         async with self._lock:
-            cur = await self.conn.execute(sql, tuple(params))
-            await self.conn.commit()
-            return cur
+            try:
+                cur = await self.conn.execute(sql, tuple(params))
+                await self.conn.commit()
+                return cur
+            except BaseException:
+                await self.conn.rollback()
+                raise
 
     async def fetchone(self, sql: str, params: Iterable[Any] = ()) -> aiosqlite.Row | None:
         async with self._lock:
@@ -217,7 +262,8 @@ class Database:
             (user_id, username, first_name, last_name, language_code, ts, ts),
         )
         user = await self.get_user(user_id)
-        assert user is not None
+        if user is None:
+            raise RuntimeError(f"failed to load user {user_id} after upsert")
         return user
 
     async def get_user(self, user_id: int) -> User | None:
@@ -226,8 +272,9 @@ class Database:
 
     async def find_user(self, query: str) -> User | None:
         query = query.strip().lstrip("@")
-        if query.isdigit() or (query.startswith("-") and query[1:].isdigit()):
-            return await self.get_user(int(query))
+        user_id = parse_telegram_user_id(query)
+        if user_id is not None:
+            return await self.get_user(user_id)
         row = await self.fetchone(
             "SELECT * FROM users WHERE username = ? COLLATE NOCASE",
             (query,),
@@ -237,7 +284,7 @@ class Database:
     async def set_flags(self, user_id: int, **flags: Any) -> None:
         if not flags:
             return
-        allowed = {
+        fields = (
             "is_banned",
             "is_blocked",
             "captcha_passed",
@@ -246,19 +293,34 @@ class Database:
             "notes",
             "forum_topic_id",
             "ui_lang",
-        }
-        parts = []
+        )
+        unknown = flags.keys() - set(fields)
+        if unknown:
+            raise ValueError(f"unknown user flag: {min(unknown)}")
+
         values: list[Any] = []
-        for key, value in flags.items():
-            if key not in allowed:
-                raise ValueError(f"unknown user flag: {key}")
-            parts.append(f"{key}=?")
+        for key in fields:
+            present = key in flags
+            value = flags.get(key)
             if isinstance(value, bool):
-                values.append(int(value))
-            else:
-                values.append(value)
+                value = int(value)
+            values.extend((int(present), value))
         values.append(user_id)
-        await self.execute(f"UPDATE users SET {', '.join(parts)} WHERE user_id=?", values)
+        await self.execute(
+            """
+            UPDATE users SET
+                is_banned=CASE WHEN ? THEN ? ELSE is_banned END,
+                is_blocked=CASE WHEN ? THEN ? ELSE is_blocked END,
+                captcha_passed=CASE WHEN ? THEN ? ELSE captcha_passed END,
+                started=CASE WHEN ? THEN ? ELSE started END,
+                muted_until=CASE WHEN ? THEN ? ELSE muted_until END,
+                notes=CASE WHEN ? THEN ? ELSE notes END,
+                forum_topic_id=CASE WHEN ? THEN ? ELSE forum_topic_id END,
+                ui_lang=CASE WHEN ? THEN ? ELSE ui_lang END
+            WHERE user_id=?
+            """,
+            values,
+        )
 
     async def get_user_by_topic(self, topic_id: int) -> User | None:
         row = await self.fetchone(
@@ -281,25 +343,20 @@ class Database:
         banned_only: bool = False,
         search: str | None = None,
     ) -> list[User]:
-        where = ["1=1"]
-        params: list[Any] = []
-        if banned_only:
-            where.append("is_banned=1")
-        if search:
-            token = f"%{search.lstrip('@')}%"
-            where.append(
-                "(CAST(user_id AS TEXT) LIKE ? OR IFNULL(username,'') LIKE ? OR IFNULL(first_name,'') LIKE ?)"
-            )
-            params.extend([token, token, token])
-        params.extend([limit, offset])
+        token = f"%{search.lstrip('@')}%" if search else None
         rows = await self.fetchall(
-            f"""
+            """
             SELECT * FROM users
-            WHERE {' AND '.join(where)}
-            ORDER BY last_seen_at DESC
-            LIMIT ? OFFSET ?
+            WHERE (?=0 OR is_banned=1)
+              AND (
+                  ? IS NULL
+                  OR CAST(user_id AS TEXT) LIKE ?
+                  OR IFNULL(username, '') LIKE ?
+                  OR IFNULL(first_name, '') LIKE ?
+              )
+            ORDER BY last_seen_at DESC LIMIT ? OFFSET ?
             """,
-            params,
+            (int(banned_only), token, token, token, token, limit, offset),
         )
         return [_user_from_row(r) for r in rows]
 
@@ -310,21 +367,27 @@ class Database:
         search: str | None = None,
         active_only: bool = False,
     ) -> int:
-        where = ["1=1"]
-        params: list[Any] = []
-        if banned_only:
-            where.append("is_banned=1")
-        if active_only:
-            where.append("started=1 AND is_banned=0 AND is_blocked=0")
-        if search:
-            token = f"%{search.lstrip('@')}%"
-            where.append(
-                "(CAST(user_id AS TEXT) LIKE ? OR IFNULL(username,'') LIKE ? OR IFNULL(first_name,'') LIKE ?)"
-            )
-            params.extend([token, token, token])
+        token = f"%{search.lstrip('@')}%" if search else None
         row = await self.fetchone(
-            f"SELECT COUNT(*) AS n FROM users WHERE {' AND '.join(where)}",
-            params,
+            """
+            SELECT COUNT(*) AS n FROM users
+            WHERE (?=0 OR is_banned=1)
+              AND (?=0 OR (started=1 AND is_banned=0 AND is_blocked=0))
+              AND (
+                  ? IS NULL
+                  OR CAST(user_id AS TEXT) LIKE ?
+                  OR IFNULL(username, '') LIKE ?
+                  OR IFNULL(first_name, '') LIKE ?
+              )
+            """,
+            (
+                int(banned_only),
+                int(active_only),
+                token,
+                token,
+                token,
+                token,
+            ),
         )
         return int(row["n"]) if row else 0
 
@@ -379,7 +442,12 @@ class Database:
             return []
         if not isinstance(data, list):
             return []
-        return [int(x) for x in data]
+        result: list[int] = []
+        for item in data:
+            user_id = parse_telegram_user_id(str(item))
+            if user_id is not None and user_id not in result:
+                result.append(user_id)
+        return result
 
     async def set_extra_admin_ids(self, ids: list[int]) -> None:
         await self.set_setting("extra_admin_ids", json.dumps(ids))
@@ -425,15 +493,54 @@ class Database:
         )
         return self._map_from_row(row) if row else None
 
-    async def maps_for_user_message(self, user_chat_id: int, user_message_id: int) -> list[MessageMap]:
+    async def editable_maps_for_user_message(
+        self, user_chat_id: int, user_message_id: int
+    ) -> list[MessageMap]:
         rows = await self.fetchall(
             """
-            SELECT * FROM message_map
-            WHERE user_chat_id=? AND user_message_id=? AND direction='in'
+            SELECT current.*
+            FROM message_map AS current
+            JOIN (
+                SELECT admin_chat_id, MAX(id) AS latest_id
+                FROM message_map
+                WHERE user_chat_id=? AND user_message_id=? AND direction='in'
+                GROUP BY admin_chat_id
+            ) AS latest ON latest.latest_id=current.id
+            ORDER BY current.id
             """,
             (user_chat_id, user_message_id),
         )
         return [self._map_from_row(r) for r in rows]
+
+    async def prune_message_maps(
+        self, before: int, *, batch_size: int = 5000, max_batches: int = 20
+    ) -> int:
+        removed = 0
+        for _ in range(max_batches):
+            async with self._lock:
+                try:
+                    cur = await self.conn.execute(
+                        """
+                        DELETE FROM message_map
+                        WHERE id IN (
+                            SELECT id FROM message_map
+                            WHERE created_at < ?
+                            ORDER BY id
+                            LIMIT ?
+                        )
+                        """,
+                        (before, batch_size),
+                    )
+                    await self.conn.commit()
+                    count = max(0, int(cur.rowcount))
+                except BaseException:
+                    await self.conn.rollback()
+                    raise
+            removed += count
+            if count < batch_size:
+                break
+            await asyncio.sleep(0)
+        return removed
 
     @staticmethod
     def _map_from_row(row: aiosqlite.Row) -> MessageMap:
@@ -608,16 +715,28 @@ class Database:
 
     # --- captcha ---
 
-    async def set_captcha(self, user_id: int, answer: str, expires_at: int) -> None:
-        await self.execute(
-            """
-            INSERT INTO captcha_challenges(user_id, answer, tries, expires_at)
-            VALUES (?, ?, 0, ?)
-            ON CONFLICT(user_id) DO UPDATE SET
-                answer=excluded.answer, tries=0, expires_at=excluded.expires_at
-            """,
-            (user_id, answer, expires_at),
-        )
+    async def create_captcha_if_absent(
+        self, user_id: int, answer: str, expires_at: int, now: int
+    ) -> bool:
+        async with self._lock:
+            try:
+                await self.conn.execute("BEGIN IMMEDIATE")
+                await self.conn.execute(
+                    "DELETE FROM captcha_challenges WHERE user_id=? AND expires_at<=?",
+                    (user_id, now),
+                )
+                cur = await self.conn.execute(
+                    """
+                    INSERT OR IGNORE INTO captcha_challenges(user_id, answer, tries, expires_at)
+                    VALUES (?, ?, 0, ?)
+                    """,
+                    (user_id, answer, expires_at),
+                )
+                await self.conn.commit()
+                return cur.rowcount == 1
+            except BaseException:
+                await self.conn.rollback()
+                raise
 
     async def get_captcha(self, user_id: int) -> tuple[str, int, int] | None:
         row = await self.fetchone(
@@ -628,24 +747,86 @@ class Database:
             return None
         return str(row["answer"]), int(row["tries"]), int(row["expires_at"])
 
-    async def bump_captcha_tries(self, user_id: int) -> int:
-        await self.execute(
-            "UPDATE captcha_challenges SET tries = tries + 1 WHERE user_id=?",
-            (user_id,),
-        )
-        row = await self.fetchone(
-            "SELECT tries FROM captcha_challenges WHERE user_id=?",
-            (user_id,),
-        )
-        return int(row["tries"]) if row else 0
-
     async def delete_captcha(self, user_id: int) -> None:
         await self.execute("DELETE FROM captcha_challenges WHERE user_id=?", (user_id,))
 
-    # --- rate limit ---
+    async def prune_expired_captchas(self, now: int) -> int:
+        cur = await self.execute(
+            "DELETE FROM captcha_challenges WHERE expires_at<=?", (now,)
+        )
+        return max(0, int(cur.rowcount))
 
-    async def add_rate_event(self, user_id: int, ts: int) -> None:
-        await self.execute("INSERT INTO rate_events(user_id, ts) VALUES (?, ?)", (user_id, ts))
+    async def delete_captcha_if_matches(
+        self, user_id: int, answer: str, expires_at: int
+    ) -> bool:
+        async with self._lock:
+            try:
+                cur = await self.conn.execute(
+                    """
+                    DELETE FROM captcha_challenges
+                    WHERE user_id=? AND answer=? AND expires_at=?
+                    """,
+                    (user_id, answer, expires_at),
+                )
+                await self.conn.commit()
+                return cur.rowcount == 1
+            except BaseException:
+                await self.conn.rollback()
+                raise
+
+    async def apply_captcha_attempt(
+        self,
+        user_id: int,
+        token: str,
+        now: int,
+        max_tries: int,
+    ) -> tuple[str, int]:
+        """Return (missing|expired|passed|failed|exhausted, tries)."""
+        async with self._lock:
+            try:
+                await self.conn.execute("BEGIN IMMEDIATE")
+                cur = await self.conn.execute(
+                    "SELECT answer, tries, expires_at FROM captcha_challenges WHERE user_id=?",
+                    (user_id,),
+                )
+                row = await cur.fetchone()
+                if row is None:
+                    await self.conn.commit()
+                    return "missing", 0
+                if int(row["expires_at"]) <= now:
+                    await self.conn.execute(
+                        "DELETE FROM captcha_challenges WHERE user_id=?", (user_id,)
+                    )
+                    await self.conn.commit()
+                    return "expired", int(row["tries"])
+                if secrets.compare_digest(str(row["answer"]), token):
+                    await self.conn.execute(
+                        "DELETE FROM captcha_challenges WHERE user_id=?", (user_id,)
+                    )
+                    await self.conn.execute(
+                        "UPDATE users SET captcha_passed=1, started=1 WHERE user_id=?",
+                        (user_id,),
+                    )
+                    await self.conn.commit()
+                    return "passed", int(row["tries"])
+                tries = int(row["tries"]) + 1
+                if tries >= max(1, max_tries):
+                    await self.conn.execute(
+                        "DELETE FROM captcha_challenges WHERE user_id=?", (user_id,)
+                    )
+                    await self.conn.commit()
+                    return "exhausted", tries
+                await self.conn.execute(
+                    "UPDATE captcha_challenges SET tries=? WHERE user_id=?",
+                    (tries, user_id),
+                )
+                await self.conn.commit()
+                return "failed", tries
+            except BaseException:
+                await self.conn.rollback()
+                raise
+
+    # --- rate limit ---
 
     async def count_rate_events(self, user_id: int, since: int) -> int:
         row = await self.fetchone(
@@ -654,8 +835,57 @@ class Database:
         )
         return int(row["n"]) if row else 0
 
-    async def prune_rate_events(self, before: int) -> None:
-        await self.execute("DELETE FROM rate_events WHERE ts < ?", (before,))
+    async def admit_rate_event(
+        self,
+        user_id: int,
+        *,
+        ts: int,
+        enabled: bool,
+        window: int,
+        limit: int,
+        mute: int,
+        prune_before: int,
+    ) -> tuple[bool, int]:
+        async with self._lock:
+            try:
+                await self.conn.execute("BEGIN IMMEDIATE")
+                await self.conn.execute(
+                    "DELETE FROM rate_events WHERE ts < ?", (prune_before,)
+                )
+                cur = await self.conn.execute(
+                    "SELECT muted_until FROM users WHERE user_id=?", (user_id,)
+                )
+                row = await cur.fetchone()
+                muted_until = int(row["muted_until"] or 0) if row else 0
+                if muted_until > ts:
+                    await self.conn.commit()
+                    return False, muted_until - ts
+                if not enabled:
+                    await self.conn.commit()
+                    return True, 0
+                cur = await self.conn.execute(
+                    "SELECT COUNT(*) AS n FROM rate_events WHERE user_id=? AND ts>=?",
+                    (user_id, ts - max(1, window)),
+                )
+                count_row = await cur.fetchone()
+                count = int(count_row["n"]) if count_row else 0
+                if count >= max(1, limit):
+                    muted_until = ts + max(1, mute)
+                    await self.conn.execute(
+                        "UPDATE users SET muted_until=? WHERE user_id=?",
+                        (muted_until, user_id),
+                    )
+                    await self.conn.commit()
+                    return False, muted_until - ts
+                await self.conn.execute(
+                    "INSERT INTO rate_events(user_id, ts) VALUES (?, ?)",
+                    (user_id, ts),
+                )
+                await self.conn.commit()
+                return True, 0
+            except BaseException:
+                await self.conn.rollback()
+                raise
 
     # --- stats ---
 
