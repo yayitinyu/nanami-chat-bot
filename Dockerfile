@@ -17,6 +17,6 @@ RUN pip install --no-cache-dir --no-compile -r requirements.txt
 
 COPY app ./app
 
-EXPOSE 8080
+EXPOSE 8080 8081
 
 CMD ["python", "-m", "app"]

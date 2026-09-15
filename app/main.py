@@ -14,6 +14,7 @@ from telegram.ext import (
 )
 
 from app.admins import AdminStore
+from app.challenge_server import ChallengeServer
 from app.config import Config
 from app.db import Database
 from app.handlers import register
@@ -55,6 +56,17 @@ async def post_init(application: Application) -> None:
     await restore_jobs(application)
     me = await application.bot.get_me()
     log.info("bot @%s ready, admins=%s", me.username, sorted(store.all_ids))
+    config: Config = application.bot_data["config"]
+    if config.turnstile_configured:
+        challenge_server = ChallengeServer(application, config)
+        await challenge_server.start()
+        application.bot_data["challenge_server"] = challenge_server
+        log.info(
+            "challenge listen=%s:%s public_host=%s",
+            config.challenge_listen,
+            config.challenge_port,
+            config.challenge_hostname,
+        )
 
 
 async def prune_message_maps(application: Application) -> int:
@@ -76,6 +88,11 @@ async def prune_message_maps_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def post_shutdown(application: Application) -> None:
+    challenge_server: ChallengeServer | None = application.bot_data.pop(
+        "challenge_server", None
+    )
+    if challenge_server is not None:
+        await challenge_server.close()
     database: Database = application.bot_data.get("db")
     if database is not None:
         await database.close()

@@ -57,6 +57,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 pass
         return
 
+    if outcome == "wrong_type":
+        await query.answer(t("captcha.pending", lang), show_alert=True)
+        return
+
     if outcome == "passed":
         await database.incr_stat("captcha_pass")
         await query.answer(t("captcha.ok", lang))

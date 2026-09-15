@@ -83,7 +83,12 @@ def antispam_overview(s: BotSettings, lang: str = "zh") -> str:
 
 
 def captcha_text(s: BotSettings, lang: str = "zh") -> str:
-    kind = t("captcha.type.button" if s.captcha_type == "button" else "captcha.type.math", lang)
+    kind_key = {
+        "button": "captcha.type.button",
+        "math": "captcha.type.math",
+        "turnstile": "captcha.type.turnstile",
+    }.get(s.captcha_type, "captcha.type.button")
+    kind = t(kind_key, lang)
     return (
         f"{t('captcha.title', lang)}\n\n"
         f"{t('captcha.switch', lang, v=on_off(s.captcha_enabled, lang))}\n"

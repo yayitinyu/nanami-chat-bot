@@ -45,3 +45,8 @@ def test_user_card_language_field_does_not_collide_and_is_escaped() -> None:
 def test_captcha_panel_shows_configured_timeout() -> None:
     panel = captcha_text(BotSettings(captcha_timeout=120), "en")
     assert "Timeout\u30002m" in panel
+
+
+def test_captcha_panel_shows_turnstile_type() -> None:
+    panel = captcha_text(BotSettings(captcha_type="turnstile"), "en")
+    assert "Type\u3000Turnstile" in panel

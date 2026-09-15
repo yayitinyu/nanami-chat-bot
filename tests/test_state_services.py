@@ -5,7 +5,7 @@ import asyncio
 import pytest
 
 from app.admins import AdminStore
-from app.models import BotSettings
+from app.models import BotSettings, next_captcha_type
 from app.services.settings import SettingsService
 
 
@@ -64,11 +64,13 @@ async def _concurrent_mutation() -> None:
     service = SettingsService(YieldingSettingsDb())  # type: ignore[arg-type]
 
     def toggle_type(settings: BotSettings) -> None:
-        settings.captcha_type = (
-            "math" if settings.captcha_type == "button" else "button"
-        )
+        settings.captcha_type = next_captcha_type(settings.captcha_type)
 
-    await asyncio.gather(service.mutate(toggle_type), service.mutate(toggle_type))
+    await asyncio.gather(
+        service.mutate(toggle_type),
+        service.mutate(toggle_type),
+        service.mutate(toggle_type),
+    )
     assert service.current.captcha_type == "button"
 
 

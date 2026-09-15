@@ -42,13 +42,22 @@ LANG_LABELS: dict[str, str] = {
 MATCH_CONTAINS = "contains"
 MATCH_EXACT = "exact"
 MATCH_REGEX = "regex"
+CAPTCHA_TYPES = ("button", "math", "turnstile")
+
+
+def next_captcha_type(value: str) -> str:
+    try:
+        current = CAPTCHA_TYPES.index(value)
+    except ValueError:
+        current = -1
+    return CAPTCHA_TYPES[(current + 1) % len(CAPTCHA_TYPES)]
 
 
 @dataclass
 class BotSettings:
     start_message: str = DEFAULT_START_MESSAGE
     captcha_enabled: bool = False
-    captcha_type: str = "button"  # button | math
+    captcha_type: str = "button"  # button | math | turnstile
     captcha_timeout: int = 120
     captcha_max_tries: int = 3
     captcha_ban_on_fail: bool = False

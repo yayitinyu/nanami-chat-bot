@@ -14,9 +14,9 @@ Telegram 私聊客服 / 消息转发机器人。用户把消息发给 Bot，管�
 - **关键词自动回复**：包含 / `exact:` / `regex:`
 - **启动消息**：自定义 `/start`（HTML）
 - **用户管理**：搜索、封禁 / 解禁、重置验证
-- **反骚扰**：验证码、限流、关键词 / 语言 / 媒体 / 链接过滤
+- **反骚扰**：按钮 / 算术 / Cloudflare Turnstile 验证、限流、关键词 / 语言 / 媒体 / 链接过滤
 
-验证码用于轻量准入，并非对专业自动化的强人机验证。公开 Bot 建议同时开启消息限流，并按实际骚扰样本维护关键词与链接策略。
+按钮和算术验证码用于轻量准入；公开 Bot 可选用 Turnstile 做更强的人机验证。建议同时开启消息限流，并按实际骚扰样本维护关键词与链接策略。
 
 ## 准备
 
@@ -55,6 +55,28 @@ WEBHOOK_SECRET=replace_with_at_least_32_random_characters
 
 Webhook 的请求体只有 Update JSON，不包含上传文件本体；建议反代仅转发配置的 webhook path、其他路径直接拒绝，并在该 location 将请求体上限设为 `1m`，避免未认证的大请求占用内存。
 
+## Cloudflare Turnstile
+
+Turnstile 为可选的第三种验证码类型；按钮和算术验证仍可在管理面板中切换。Telegram 中的按钮会打开一个短时验证链接，验证页只在 Cloudflare Siteverify 成功且 `hostname`、`action`、`cdata` 全部匹配后放行用户。
+
+先创建 Managed Widget 和 Siteverify Worker，然后同时配置：
+
+```dotenv
+CHALLENGE_PUBLIC_URL=https://challenge.example.com
+TURNSTILE_SITEKEY=0x4AAAAAA_your_public_sitekey
+TURNSTILE_VERIFY_URL=https://turnstile-siteverify-example.workers.dev
+```
+
+Bot 在容器内单独监听 `0.0.0.0:8081`。Compose 默认仅发布到宿主机 `127.0.0.1:8081`，将验证域名反代到该端口，例如 Caddy：
+
+```caddyfile
+challenge.example.com {
+    reverse_proxy 127.0.0.1:8081
+}
+```
+
+一次性挑战标识放在 URL fragment 中，不会发送给反向代理或进入常规访问日志。请勿记录 `/verify` 的 POST 请求体。Siteverify Secret 只保存在 Cloudflare Worker Secret 中，Bot 无需持有它。
+
 ## 环境变量
 
 | 变量 | 说明 |
@@ -68,6 +90,12 @@ Webhook 的请求体只有 Update JSON，不包含上传文件本体；建议反
 | `WEBHOOK_PORT` | 默认 `8080`。Docker Compose 下这是**宿主机**映射端口，容器内进程固定监听 `8080` |
 | `WEBHOOK_PATH` | 默认 `/telegram`（若 URL 里已有 path 则用 URL） |
 | `WEBHOOK_SECRET` | Webhook 必填。32–256 位，仅允许字母、数字、`_`、`-` |
+| `CHALLENGE_PUBLIC_URL` | 可选。Turnstile 验证页的公网 HTTPS Origin |
+| `CHALLENGE_LISTEN` | 验证页容器内监听地址，默认 `0.0.0.0` |
+| `CHALLENGE_BIND` | Compose 验证页宿主机发布地址，默认 `127.0.0.1` |
+| `CHALLENGE_PORT` | 默认 `8081`；Docker Compose 下为宿主机映射端口，容器内固定监听 `8081` |
+| `TURNSTILE_SITEKEY` | Turnstile Widget 的公开 Sitekey |
+| `TURNSTILE_VERIFY_URL` | 托管 Siteverify Worker 的 HTTPS 地址 |
 | `DATABASE_PATH` | 默认 `data/bot.db` |
 | `TZ` | 默认 `Asia/Shanghai` |
 | `LOG_LEVEL` | 默认 `INFO` |

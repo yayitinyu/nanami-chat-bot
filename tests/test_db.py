@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -64,7 +65,9 @@ async def _flow(path: Path) -> None:
         indexes = await db.fetchall("PRAGMA index_list(rate_events)")
         assert "idx_rate_ts" in {str(row["name"]) for row in indexes}
         indexes = await db.fetchall("PRAGMA index_list(captcha_challenges)")
-        assert "idx_captcha_expires" in {str(row["name"]) for row in indexes}
+        captcha_indexes = {str(row["name"]) for row in indexes}
+        assert "idx_captcha_expires" in captcha_indexes
+        assert "idx_captcha_turnstile_token" in captcha_indexes
 
         await db.add_map(
             user_id=1,
@@ -150,12 +153,87 @@ async def _captcha_flow(path: Path) -> None:
         assert await db.delete_captcha_if_matches(9, "old", 300)
         assert await db.create_captcha_if_absent(9, "expired", 400, 300)
         assert await db.prune_expired_captchas(400) == 1
+
+        turnstile = "ts_" + "a" * 43
+        assert await db.create_captcha_if_absent(
+            9,
+            turnstile,
+            600,
+            400,
+            kind="turnstile",
+        )
+        assert await db.apply_captcha_attempt(9, turnstile, 400, 3) == (
+            "wrong_type",
+            0,
+        )
+        assert await db.get_turnstile_challenge(turnstile, 400) == (
+            "active",
+            9,
+            0,
+        )
+        assert await db.apply_turnstile_attempt(turnstile, 400, False, 2) == (
+            "failed",
+            9,
+            1,
+        )
+        assert await db.apply_turnstile_attempt(turnstile, 400, False, 2) == (
+            "exhausted",
+            9,
+            2,
+        )
+
+        passed = "ts_" + "b" * 43
+        assert await db.create_captcha_if_absent(
+            9,
+            passed,
+            700,
+            400,
+            kind="turnstile",
+        )
+        assert await db.apply_turnstile_attempt(passed, 400, True, 2) == (
+            "passed",
+            9,
+            0,
+        )
+        assert await db.apply_turnstile_attempt(passed, 400, True, 2) == (
+            "missing",
+            None,
+            0,
+        )
     finally:
         await db.close()
 
 
 def test_captcha_state_transitions_are_atomic(tmp_path: Path) -> None:
     asyncio.run(_captcha_flow(tmp_path / "captcha.db"))
+
+
+def test_legacy_captcha_table_is_migrated(tmp_path: Path) -> None:
+    path = tmp_path / "legacy.db"
+    connection = sqlite3.connect(path)
+    connection.execute(
+        """
+        CREATE TABLE captcha_challenges (
+            user_id INTEGER PRIMARY KEY,
+            answer TEXT NOT NULL,
+            tries INTEGER NOT NULL DEFAULT 0,
+            expires_at INTEGER NOT NULL
+        )
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    async def flow() -> None:
+        db = Database(path)
+        await db.init()
+        try:
+            columns = await db.fetchall("PRAGMA table_info(captcha_challenges)")
+            assert "kind" in {str(row["name"]) for row in columns}
+        finally:
+            await db.close()
+
+    asyncio.run(flow())
 
 
 async def _failed_commit_rolls_back(path: Path) -> None:

@@ -9,6 +9,11 @@ from telegram.ext import ContextTypes
 
 from app import ctx
 from app.i18n import t
+from app.services.turnstile import (
+    TURNSTILE_KIND,
+    build_challenge_url,
+    new_challenge_token,
+)
 from app.utils import now_ts
 
 if TYPE_CHECKING:
@@ -64,14 +69,42 @@ async def send_challenge(
     database = ctx.db(context)
     settings = ctx.settings_svc(context).current
     lang = ctx.user_lang(user)
-    if settings.captcha_type == "math":
+    kind = "legacy"
+    if settings.captcha_type == "turnstile":
+        config = ctx.config(context)
+        if not config.turnstile_configured or not config.challenge_public_url:
+            try:
+                await message.reply_text(t("captcha.unavailable", lang))
+            except TelegramError:
+                pass
+            return False
+        answer = new_challenge_token()
+        markup = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        t("captcha.open", lang),
+                        url=build_challenge_url(config.challenge_public_url, answer),
+                    )
+                ]
+            ]
+        )
+        prompt = t("captcha.turnstile", lang)
+        kind = TURNSTILE_KIND
+    elif settings.captcha_type == "math":
         answer, markup, prompt = build_math_challenge(lang)
     else:
         answer, markup = build_button_challenge()
         prompt = t("captcha.button", lang)
     current = now_ts()
     expires = current + settings.captcha_timeout
-    created = await database.create_captcha_if_absent(user.id, answer, expires, current)
+    created = await database.create_captcha_if_absent(
+        user.id,
+        answer,
+        expires,
+        current,
+        kind=kind,
+    )
     if not created:
         return False
     try:

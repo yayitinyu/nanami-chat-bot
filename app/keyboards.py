@@ -103,7 +103,12 @@ def antispam_menu(s: BotSettings, lang: str = "zh") -> InlineKeyboardMarkup:
 
 
 def captcha_menu(s: BotSettings, lang: str = "zh") -> InlineKeyboardMarkup:
-    kind = t("captcha.type.button" if s.captcha_type == "button" else "captcha.type.math", lang)
+    kind_key = {
+        "button": "captcha.type.button",
+        "math": "captcha.type.math",
+        "turnstile": "captcha.type.turnstile",
+    }.get(s.captcha_type, "captcha.type.button")
+    kind = t(kind_key, lang)
     return InlineKeyboardMarkup(
         [
             [_btn(f"{t('btn.toggle', lang)} {on_off(s.captcha_enabled, lang)}", "cap:toggle")],

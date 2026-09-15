@@ -102,6 +102,7 @@ CREATE INDEX IF NOT EXISTS idx_rate_ts ON rate_events(ts);
 CREATE TABLE IF NOT EXISTS captcha_challenges (
     user_id INTEGER PRIMARY KEY,
     answer TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'legacy',
     tries INTEGER NOT NULL DEFAULT 0,
     expires_at INTEGER NOT NULL
 );
@@ -193,6 +194,13 @@ class Database:
             await self.execute("ALTER TABLE users ADD COLUMN forum_topic_id INTEGER")
         if "ui_lang" not in names:
             await self.execute("ALTER TABLE users ADD COLUMN ui_lang TEXT")
+        captcha_rows = await self.fetchall("PRAGMA table_info(captcha_challenges)")
+        captcha_names = {str(r[1]) for r in captcha_rows}
+        if "kind" not in captcha_names:
+            await self.execute(
+                "ALTER TABLE captcha_challenges "
+                "ADD COLUMN kind TEXT NOT NULL DEFAULT 'legacy'"
+            )
         await self.execute(
             """
             CREATE UNIQUE INDEX IF NOT EXISTS idx_users_topic
@@ -206,6 +214,10 @@ class Database:
         await self.execute(
             "CREATE INDEX IF NOT EXISTS idx_captcha_expires "
             "ON captcha_challenges(expires_at)"
+        )
+        await self.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_captcha_turnstile_token "
+            "ON captcha_challenges(answer) WHERE kind = 'turnstile'"
         )
 
     @property
@@ -716,8 +728,16 @@ class Database:
     # --- captcha ---
 
     async def create_captcha_if_absent(
-        self, user_id: int, answer: str, expires_at: int, now: int
+        self,
+        user_id: int,
+        answer: str,
+        expires_at: int,
+        now: int,
+        *,
+        kind: str = "legacy",
     ) -> bool:
+        if kind not in {"legacy", "turnstile"}:
+            raise ValueError("unknown captcha kind")
         async with self._lock:
             try:
                 await self.conn.execute("BEGIN IMMEDIATE")
@@ -727,10 +747,12 @@ class Database:
                 )
                 cur = await self.conn.execute(
                     """
-                    INSERT OR IGNORE INTO captcha_challenges(user_id, answer, tries, expires_at)
-                    VALUES (?, ?, 0, ?)
+                    INSERT OR IGNORE INTO captcha_challenges(
+                        user_id, answer, kind, tries, expires_at
+                    )
+                    VALUES (?, ?, ?, 0, ?)
                     """,
-                    (user_id, answer, expires_at),
+                    (user_id, answer, kind, expires_at),
                 )
                 await self.conn.commit()
                 return cur.rowcount == 1
@@ -781,12 +803,13 @@ class Database:
         now: int,
         max_tries: int,
     ) -> tuple[str, int]:
-        """Return (missing|expired|passed|failed|exhausted, tries)."""
+        """Return (missing|expired|wrong_type|passed|failed|exhausted, tries)."""
         async with self._lock:
             try:
                 await self.conn.execute("BEGIN IMMEDIATE")
                 cur = await self.conn.execute(
-                    "SELECT answer, tries, expires_at FROM captcha_challenges WHERE user_id=?",
+                    "SELECT answer, kind, tries, expires_at "
+                    "FROM captcha_challenges WHERE user_id=?",
                     (user_id,),
                 )
                 row = await cur.fetchone()
@@ -799,6 +822,9 @@ class Database:
                     )
                     await self.conn.commit()
                     return "expired", int(row["tries"])
+                if str(row["kind"]) == "turnstile":
+                    await self.conn.commit()
+                    return "wrong_type", int(row["tries"])
                 if secrets.compare_digest(str(row["answer"]), token):
                     await self.conn.execute(
                         "DELETE FROM captcha_challenges WHERE user_id=?", (user_id,)
@@ -822,6 +848,99 @@ class Database:
                 )
                 await self.conn.commit()
                 return "failed", tries
+            except BaseException:
+                await self.conn.rollback()
+                raise
+
+    async def get_turnstile_challenge(
+        self, token: str, now: int
+    ) -> tuple[str, int | None, int]:
+        """Return (missing|expired|active, user_id, tries)."""
+        row = await self.fetchone(
+            """
+            SELECT user_id, tries, expires_at
+            FROM captcha_challenges
+            WHERE kind='turnstile' AND answer=?
+            """,
+            (token,),
+        )
+        if row is None:
+            return "missing", None, 0
+        user_id = int(row["user_id"])
+        tries = int(row["tries"])
+        expires_at = int(row["expires_at"])
+        if expires_at <= now:
+            # Match all issuance fields so a concurrently replaced challenge is
+            # never removed by expiry cleanup from this stale read.
+            await self.delete_captcha_if_matches(user_id, token, expires_at)
+            return "expired", user_id, tries
+        return "active", user_id, tries
+
+    async def apply_turnstile_attempt(
+        self,
+        token: str,
+        now: int,
+        passed: bool,
+        max_tries: int,
+    ) -> tuple[str, int | None, int]:
+        """Atomically apply a verified Turnstile result to its challenge."""
+        async with self._lock:
+            try:
+                await self.conn.execute("BEGIN IMMEDIATE")
+                cur = await self.conn.execute(
+                    """
+                    SELECT c.user_id, c.tries, c.expires_at, u.is_banned
+                    FROM captcha_challenges AS c
+                    JOIN users AS u ON u.user_id = c.user_id
+                    WHERE c.kind='turnstile' AND c.answer=?
+                    """,
+                    (token,),
+                )
+                row = await cur.fetchone()
+                if row is None:
+                    await self.conn.commit()
+                    return "missing", None, 0
+                user_id = int(row["user_id"])
+                tries = int(row["tries"])
+                if int(row["expires_at"]) <= now:
+                    await self.conn.execute(
+                        "DELETE FROM captcha_challenges WHERE user_id=?",
+                        (user_id,),
+                    )
+                    await self.conn.commit()
+                    return "expired", user_id, tries
+                if bool(row["is_banned"]):
+                    await self.conn.execute(
+                        "DELETE FROM captcha_challenges WHERE user_id=?",
+                        (user_id,),
+                    )
+                    await self.conn.commit()
+                    return "blocked", user_id, tries
+                if passed:
+                    await self.conn.execute(
+                        "DELETE FROM captcha_challenges WHERE user_id=?",
+                        (user_id,),
+                    )
+                    await self.conn.execute(
+                        "UPDATE users SET captcha_passed=1, started=1 WHERE user_id=?",
+                        (user_id,),
+                    )
+                    await self.conn.commit()
+                    return "passed", user_id, tries
+                tries += 1
+                if tries >= max(1, max_tries):
+                    await self.conn.execute(
+                        "DELETE FROM captcha_challenges WHERE user_id=?",
+                        (user_id,),
+                    )
+                    await self.conn.commit()
+                    return "exhausted", user_id, tries
+                await self.conn.execute(
+                    "UPDATE captcha_challenges SET tries=? WHERE user_id=?",
+                    (tries, user_id),
+                )
+                await self.conn.commit()
+                return "failed", user_id, tries
             except BaseException:
                 await self.conn.rollback()
                 raise

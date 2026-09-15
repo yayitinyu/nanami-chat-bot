@@ -1,4 +1,11 @@
+from urllib.parse import urlsplit
+
 from app.services.captcha import build_button_challenge, build_math_challenge
+from app.services.turnstile import (
+    build_challenge_url,
+    is_challenge_token,
+    new_challenge_token,
+)
 
 
 def test_button_challenge_unique_tokens() -> None:
@@ -26,3 +33,15 @@ def test_math_challenge_unique_tokens() -> None:
     ]
     assert winner in tokens
     assert len(set(tokens)) == 4
+
+
+def test_turnstile_link_keeps_capability_out_of_request_url() -> None:
+    challenge = new_challenge_token()
+    url = build_challenge_url("https://challenge.example.com/", challenge)
+    parsed = urlsplit(url)
+    assert is_challenge_token(challenge)
+    assert parsed.scheme == "https"
+    assert parsed.netloc == "challenge.example.com"
+    assert parsed.path == "/verify"
+    assert parsed.query == ""
+    assert parsed.fragment == challenge

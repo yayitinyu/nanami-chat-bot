@@ -16,10 +16,13 @@ services:
       # the published mapping targets. Without this override, setting
       # WEBHOOK_PORT=28080 makes the app bind 28080 while Docker forwards to 8080.
       WEBHOOK_PORT: "8080"
+      # The optional Turnstile page uses a separate internal listener.
+      CHALLENGE_PORT: "8081"
     volumes:
       - bot-data:/app/data
     ports:
       - "${WEBHOOK_BIND:-127.0.0.1}:${WEBHOOK_PORT:-8080}:8080"
+      - "${CHALLENGE_BIND:-127.0.0.1}:${CHALLENGE_PORT:-8081}:8081"
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=64m
     security_opt:

@@ -11,7 +11,7 @@ from app.handlers import admin_await, panels
 from app.handlers.admin_reply import on_admin_reply
 from app.handlers.common import admit_global_update, clear_await, safe_reply, set_await
 from app.i18n import t
-from app.models import LANG_LABELS, MEDIA_TYPES
+from app.models import LANG_LABELS, MEDIA_TYPES, next_captcha_type
 from app.services.broadcast import deliver, schedule, unschedule
 from app.services.topics import is_user_topic
 from app.utils import parse_telegram_user_id
@@ -298,9 +298,7 @@ async def _captcha(query, context, rest: str) -> None:
         await svc.toggle("captcha_enabled")
     elif rest == "type":
         def toggle_type(settings) -> None:
-            settings.captcha_type = (
-                "math" if settings.captcha_type == "button" else "button"
-            )
+            settings.captcha_type = next_captcha_type(settings.captcha_type)
 
         await svc.mutate(toggle_type)
     elif rest == "ban":

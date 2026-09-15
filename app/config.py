@@ -37,6 +37,20 @@ class Config(BaseSettings):
     webhook_port: int = Field(default=8080, ge=1, le=65535, alias="WEBHOOK_PORT")
     webhook_path: str = Field(default="/telegram", alias="WEBHOOK_PATH")
     webhook_secret: str | None = Field(default=None, alias="WEBHOOK_SECRET")
+    challenge_public_url: str | None = Field(
+        default=None, alias="CHALLENGE_PUBLIC_URL"
+    )
+    challenge_listen: str = Field(
+        default="0.0.0.0",  # nosec B104
+        min_length=1,
+        max_length=255,
+        alias="CHALLENGE_LISTEN",
+    )
+    challenge_port: int = Field(default=8081, ge=1, le=65535, alias="CHALLENGE_PORT")
+    turnstile_sitekey: str | None = Field(default=None, alias="TURNSTILE_SITEKEY")
+    turnstile_verify_url: str | None = Field(
+        default=None, alias="TURNSTILE_VERIFY_URL"
+    )
     max_concurrent_updates: int = Field(
         default=16, ge=1, le=64, alias="MAX_CONCURRENT_UPDATES"
     )
@@ -102,7 +116,14 @@ class Config(BaseSettings):
             return None
         return int(value)
 
-    @field_validator("webhook_url", "webhook_secret", mode="before")
+    @field_validator(
+        "webhook_url",
+        "webhook_secret",
+        "challenge_public_url",
+        "turnstile_sitekey",
+        "turnstile_verify_url",
+        mode="before",
+    )
     @classmethod
     def _empty_str_none(cls, value: object) -> object:
         if isinstance(value, str) and not value.strip():
@@ -175,9 +196,104 @@ class Config(BaseSettings):
             raise ValueError("WEBHOOK_SECRET is required when WEBHOOK_URL is set")
         return self
 
+    @field_validator("challenge_public_url")
+    @classmethod
+    def _validate_challenge_public_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        parsed = urlparse(value)
+        try:
+            _ = parsed.port
+        except ValueError as exc:
+            raise ValueError("CHALLENGE_PUBLIC_URL contains an invalid port") from exc
+        if (
+            parsed.scheme.lower() != "https"
+            or not parsed.hostname
+            or not normalize_domain(value)
+            or parsed.username
+            or parsed.password
+            or parsed.query
+            or parsed.fragment
+            or parsed.path not in {"", "/"}
+        ):
+            raise ValueError(
+                "CHALLENGE_PUBLIC_URL must be an HTTPS origin without path, "
+                "credentials, query, or fragment"
+            )
+        return value.rstrip("/")
+
+    @field_validator("turnstile_verify_url")
+    @classmethod
+    def _validate_turnstile_verify_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        parsed = urlparse(value)
+        try:
+            _ = parsed.port
+        except ValueError as exc:
+            raise ValueError("TURNSTILE_VERIFY_URL contains an invalid port") from exc
+        if (
+            parsed.scheme.lower() != "https"
+            or not parsed.hostname
+            or not normalize_domain(value)
+            or parsed.username
+            or parsed.password
+            or parsed.query
+            or parsed.fragment
+            or parsed.path not in {"", "/", "/siteverify"}
+        ):
+            raise ValueError(
+                "TURNSTILE_VERIFY_URL must be an HTTPS Worker endpoint without "
+                "credentials, query, or fragment"
+            )
+        return value.rstrip("/")
+
+    @field_validator("turnstile_sitekey")
+    @classmethod
+    def _validate_turnstile_sitekey(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not re.fullmatch(r"[A-Za-z0-9_-]{3,128}", value):
+            raise ValueError("TURNSTILE_SITEKEY contains invalid characters")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_turnstile(self) -> Config:
+        values = (
+            self.challenge_public_url,
+            self.turnstile_sitekey,
+            self.turnstile_verify_url,
+        )
+        if any(values) and not all(values):
+            raise ValueError(
+                "CHALLENGE_PUBLIC_URL, TURNSTILE_SITEKEY, and "
+                "TURNSTILE_VERIFY_URL must be configured together"
+            )
+        if (
+            self.turnstile_configured
+            and self.webhook_enabled
+            and self.challenge_port == self.webhook_port
+        ):
+            raise ValueError("CHALLENGE_PORT must differ from WEBHOOK_PORT")
+        return self
+
     @property
     def webhook_enabled(self) -> bool:
         return bool(self.webhook_url)
+
+    @property
+    def turnstile_configured(self) -> bool:
+        return bool(
+            self.challenge_public_url
+            and self.turnstile_sitekey
+            and self.turnstile_verify_url
+        )
+
+    @property
+    def challenge_hostname(self) -> str | None:
+        if not self.challenge_public_url:
+            return None
+        return urlparse(self.challenge_public_url).hostname
 
     @property
     def webhook_url_path(self) -> str:
