@@ -27,7 +27,7 @@ jobs:
   image-check:
     needs: test
     if: github.event_name == 'pull_request'
-    uses: docker/github-builder/.github/workflows/build.yml@58cb9f5b71b1836d6f690c1e95effdeb9b98cb8a # v1
+    uses: docker/github-builder/.github/workflows/build.yml@cbc9d42f8c89a55623392aadd03600965b80e963 # v1
     permissions:
       contents: read
     with:
@@ -51,7 +51,7 @@ jobs:
   image-publish:
     needs: test
     if: github.event_name != 'pull_request'
-    uses: docker/github-builder/.github/workflows/build.yml@58cb9f5b71b1836d6f690c1e95effdeb9b98cb8a # v1
+    uses: docker/github-builder/.github/workflows/build.yml@cbc9d42f8c89a55623392aadd03600965b80e963 # v1
     permissions:
       contents: read
       id-token: write
